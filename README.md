@@ -68,6 +68,16 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 
 产物：仓库根目录的 `MsiScenarioLite.exe`。运行目录需包含 `Assets\` 与上述三个微星依赖 DLL/EXE（即仓库根目录本身）。
 
+### 编码约定（改脚本前必读）
+
+| 文件类型 | 编码 | 原因 |
+| :--- | :--- | :--- |
+| `*.bat` | **纯 ASCII**（不得含中文） | `cmd.exe` 按**控制台 OEM 代码页**解析批处理文件，UTF-8 中文会被解成乱码并被当成命令执行；`chcp 65001` 无法修复这一点 |
+| `*.ps1` | **UTF-8 with BOM** | Windows PowerShell 5.1 无 BOM 时按 ANSI 解析，中文会乱码甚至语法报错 |
+| `*.cs` / `*.md` | UTF-8（可无 BOM） | 编译器和 GitHub 均按 UTF-8 处理 |
+
+需要中文提示时，把文案放进 PowerShell 脚本，由 `.bat` 调用它输出。
+
 ---
 
 ## 使用
