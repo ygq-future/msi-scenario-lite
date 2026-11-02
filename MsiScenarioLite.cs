@@ -20,23 +20,88 @@ using Drawing = System.Drawing;
 
 [assembly: AssemblyTitle("MSI Scenario Lite")]
 [assembly: AssemblyProduct("MSI Scenario Lite (MSI EC / WMIACPI)")]
-[assembly: AssemblyVersion("1.3.0.0")]
+[assembly: AssemblyVersion("1.4.0.0")]
 
 namespace MsiScenarioLite
 {
     public static class EcHardwareController
     {
-        [DllImport("UEFIVaribleDll.dll", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Unicode)]
-        private static extern bool CheckPrivileges();
+        // ---- UEFI variable MsiDCVarData --------------------------------------------
+        // Real layout (verified on Alpha 17 C7VF): 20 bytes, byte[0] selects the MUX
+        // mode used at the next boot (0 / 1). MSI's UEFIVaribleDll.dll only exports
+        // GetUEFIVariableEx / SetUEFIVariableEx, so we call kernel32 directly instead.
 
-        [DllImport("UEFIVaribleDll.dll", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Unicode)]
-        private static extern bool GetVariable(string name, string guid, byte[] buffer);
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern uint GetFirmwareEnvironmentVariableW(string name, string guid, byte[] buffer, uint size);
 
-        [DllImport("UEFIVaribleDll.dll", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Unicode)]
-        private static extern bool SetVariable(string name, string guid, byte[] buffer, int size);
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern bool SetFirmwareEnvironmentVariableW(string name, string guid, byte[] buffer, uint size);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern bool LookupPrivilegeValue(string system, string name, out long luid);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern bool AdjustTokenPrivileges(IntPtr token, bool disableAll, IntPtr newState, uint len, IntPtr prev, out uint retLen);
+
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr GetCurrentProcess();
 
         private const string MsiUefiVarName = "MsiDCVarData";
         private const string MsiUefiVarGuid = "{DD96BAAF-145E-4F56-B1CF-193256298E99}";
+
+        private static bool uefiPrivilegeReady;
+
+        private static bool EnsureUefiPrivilege()
+        {
+            if (uefiPrivilegeReady) return true;
+
+            IntPtr token;
+            if (!OpenProcessToken(GetCurrentProcess(), 0x0020 | 0x0008, out token)) return false;
+
+            long luid;
+            if (!LookupPrivilegeValue(null, "SeSystemEnvironmentPrivilege", out luid)) return false;
+
+            IntPtr state = Marshal.AllocHGlobal(16);
+            try
+            {
+                Marshal.WriteInt32(state, 0, 1);
+                Marshal.WriteInt64(state, 4, luid);
+                Marshal.WriteInt32(state, 12, 2);
+
+                uint returned;
+                if (!AdjustTokenPrivileges(token, false, state, 0, IntPtr.Zero, out returned)) return false;
+                if (Marshal.GetLastWin32Error() != 0) return false;   // 1300 = not assigned
+
+                uefiPrivilegeReady = true;
+                return true;
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(state);
+            }
+        }
+
+        private static byte[] ReadGpuUefiRaw(out uint size)
+        {
+            size = 0;
+            if (!EnsureUefiPrivilege()) return null;
+
+            byte[] buffer = new byte[64];
+            uint read = GetFirmwareEnvironmentVariableW(MsiUefiVarName, MsiUefiVarGuid, buffer, (uint)buffer.Length);
+            if (read == 0 || read > buffer.Length) return null;
+
+            size = read;
+            return buffer;
+        }
+
+        private static bool WriteGpuUefiRaw(byte[] buffer, uint size)
+        {
+            if (!EnsureUefiPrivilege()) return false;
+            return SetFirmwareEnvironmentVariableW(MsiUefiVarName, MsiUefiVarGuid, buffer, size);
+        }
 
         private static WmiAcpiLib2 Wmi
         {
@@ -184,124 +249,177 @@ namespace MsiScenarioLite
             return true;
         }
 
-        public static bool? ReadStagedGpuModeIsDiscrete()
+        // ---- persisted GPU target -------------------------------------------------
+        // The EC latch (0xD1) is cleared by the firmware once the UEFI variable is
+        // written, so it cannot be used as the source of truth. We persist the
+        // intended next-boot mode ourselves and treat it as authoritative.
+
+        private static string StateDir
         {
-            bool currentDiscrete = ReadIsDiscreteGpuMode();
+            get
+            {
+                return System.IO.Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "MsiScenarioLite");
+            }
+        }
+
+        public static bool? LoadPersistedGpuTarget()
+        {
+            try
+            {
+                string path = System.IO.Path.Combine(StateDir, "gpu-target.txt");
+                if (!System.IO.File.Exists(path)) return null;
+
+                string text = System.IO.File.ReadAllText(path).Trim();
+                if (text == "1") return true;
+                if (text == "0") return false;
+                return null;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        public static void SavePersistedGpuTarget(bool? target)
+        {
+            try
+            {
+                System.IO.Directory.CreateDirectory(StateDir);
+                System.IO.File.WriteAllText(
+                    System.IO.Path.Combine(StateDir, "gpu-target.txt"),
+                    target.HasValue ? (target.Value ? "1" : "0") : string.Empty);
+            }
+            catch { }
+        }
+
+        public static void LogGpu(string message)
+        {
+            try
+            {
+                System.IO.Directory.CreateDirectory(StateDir);
+                System.IO.File.AppendAllText(
+                    System.IO.Path.Combine(StateDir, "gpu-switch.log"),
+                    DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") + "  " + message + Environment.NewLine);
+            }
+            catch { }
+        }
+
+        private static bool ReadEcSwitchLatch()
+        {
             var rAp = Wmi.InvokeWmiMethod(WmiAcpiLib2.Methods.Get_AP, (byte)0, null);
             if (rAp.InvokeMethodResult && rAp.Flag == 1 && rAp.Data != null && rAp.Data.Length > 1)
             {
-                byte b = rAp.Data[1];
-                bool switchPending = (b & 0x03) != 0;
-                return switchPending ? !currentDiscrete : currentDiscrete;
+                return (rAp.Data[1] & 0x03) != 0;
             }
-            return currentDiscrete;
+            return false;
         }
 
-        private static void ToggleUefiGpuVariableFast()
+        // Which mode the firmware will boot into next (i.e. what the variable encodes).
+        public static bool ReadEncodedGpuTarget(bool currentDiscrete)
         {
+            bool? persisted = LoadPersistedGpuTarget();
+            if (persisted.HasValue)
+            {
+                // A persisted value different from the running mode means the switch is
+                // still pending; the EC latch may already be cleared, so trust persistence.
+                return persisted.Value;
+            }
+
+            return ReadEcSwitchLatch() ? !currentDiscrete : currentDiscrete;
+        }
+
+        public static bool? ReadStagedGpuModeIsDiscrete()
+        {
+            bool currentDiscrete = ReadIsDiscreteGpuMode();
+            bool? persisted = LoadPersistedGpuTarget();
+            if (persisted.HasValue) return persisted.Value;
+
+            return ReadEcSwitchLatch() ? !currentDiscrete : currentDiscrete;
+        }
+
+        public sealed class GpuApplyResult
+        {
+            public bool Ok;
+            public string Error;
+        }
+
+        // Deterministic MUX staging: read the 20-byte variable, flip byte[0], write it
+        // back and verify. No blind toggling, no dependency on ResetUEFIVariable.exe.
+        public static GpuApplyResult ApplyGpuTarget(bool targetDiscrete, bool currentDiscrete, bool encodedTarget)
+        {
+            GpuApplyResult result = new GpuApplyResult();
+
+            if (targetDiscrete == encodedTarget)
+            {
+                SavePersistedGpuTarget(targetDiscrete);
+                LogGpu(string.Format("no-op  current={0} target={1} (already encoded)",
+                    currentDiscrete ? "Discrete" : "Hybrid", targetDiscrete ? "Discrete" : "Hybrid"));
+                result.Ok = true;
+                return result;
+            }
+
+            uint size;
+            byte[] raw = ReadGpuUefiRaw(out size);
+            if (raw == null || size < 1)
+            {
+                result.Error = "无法读取 UEFI 变量 MsiDCVarData（需要管理员权限）。";
+                LogGpu("ERROR read MsiDCVarData failed");
+                return result;
+            }
+
+            byte before = raw[0];
+            raw[0] = (byte)(before == 1 ? 0 : 1);
+
+            if (!WriteGpuUefiRaw(raw, size))
+            {
+                result.Error = "写入 UEFI 变量 MsiDCVarData 失败。";
+                LogGpu("ERROR write MsiDCVarData failed");
+                return result;
+            }
+
+            uint verifySize;
+            byte[] verify = ReadGpuUefiRaw(out verifySize);
+            if (verify == null || verify[0] != raw[0])
+            {
+                result.Error = "UEFI 变量写入后校验失败。";
+                LogGpu("ERROR verify MsiDCVarData failed");
+                return result;
+            }
+
+            // Keep the EC latch consistent with MSI's own flow: 0x05 = switch pending, 0x04 = none.
+            var rAp = Wmi.InvokeWmiMethod(WmiAcpiLib2.Methods.Get_AP, (byte)0, null);
+            byte b = 0x04;
+            if (rAp.InvokeMethodResult && rAp.Flag == 1 && rAp.Data != null && rAp.Data.Length > 1) b = rAp.Data[1];
+
+            byte latchBase = (byte)(b & 0xFC);
+            if (latchBase == 0) latchBase = 0x04;   // keep the "no request" baseline sane
+
+            byte latch = (targetDiscrete != currentDiscrete) ? (byte)(latchBase | 0x01) : latchBase;
+            Wmi.InvokeWmiMethod(WmiAcpiLib2.Methods.Set_Data, (byte)0xD1, new byte[] { latch });
+
             try
             {
-                if (CheckPrivileges())
+                using (RegistryKey baseKey = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry32))
+                using (RegistryKey gsKey = baseKey.OpenSubKey(@"SOFTWARE\MSI\MSI Center\Component\Base Module\GeneralSetting", true))
                 {
-                    byte[] buf = new byte[4096];
-                    if (GetVariable(MsiUefiVarName, MsiUefiVarGuid, buf))
+                    if (gsKey != null)
                     {
-                        buf[58] = (buf[58] == 1) ? (byte)0 : (byte)1;
-                        if (SetVariable(MsiUefiVarName, MsiUefiVarGuid, buf, 72))
-                        {
-                            return;
-                        }
+                        gsKey.SetValue("GPU_Switch", targetDiscrete ? 0 : 1, RegistryValueKind.DWord);
                     }
                 }
             }
             catch { }
 
-            // Fallback to ResetUEFIVariable.exe only if direct P/Invoke fails
-            try
-            {
-                string baseDir = AppDomain.CurrentDomain.BaseDirectory;
-                string resetExe = System.IO.Path.Combine(baseDir, "ResetUEFIVariable.exe");
-                if (!File.Exists(resetExe))
-                {
-                    resetExe = @"C:\Program Files (x86)\MSI\MSI NBFoundation Service\ResetUEFIVariable.exe";
-                }
-                if (File.Exists(resetExe))
-                {
-                    ProcessStartInfo psi = new ProcessStartInfo(resetExe)
-                    {
-                        WorkingDirectory = System.IO.Path.GetDirectoryName(resetExe),
-                        UseShellExecute = false,
-                        CreateNoWindow = true,
-                        WindowStyle = ProcessWindowStyle.Hidden
-                    };
-                    using (Process p = Process.Start(psi))
-                    {
-                        if (p != null) p.WaitForExit(2000);
-                    }
-                }
-            }
-            catch { }
-        }
+            SavePersistedGpuTarget(targetDiscrete);
+            LogGpu(string.Format("applied current={0} target={1} uefi {2}->{3} size={4} latch=0x{5:X2}",
+                currentDiscrete ? "Discrete" : "Hybrid",
+                targetDiscrete ? "Discrete" : "Hybrid",
+                before, raw[0], size, latch));
 
-        public static bool StageGpuModeForNextBoot(bool toDiscrete, bool wasDiffBefore, out string errorMsg)
-        {
-            errorMsg = null;
-            try
-            {
-                bool currentDiscrete = ReadIsDiscreteGpuMode();
-                bool wantSwitchOnBoot = (toDiscrete != currentDiscrete);
-
-                var rAp = Wmi.InvokeWmiMethod(WmiAcpiLib2.Methods.Get_AP, (byte)0, null);
-                byte b = 0x04;
-                if (rAp.InvokeMethodResult && rAp.Flag == 1 && rAp.Data != null && rAp.Data.Length > 1)
-                {
-                    b = rAp.Data[1];
-                }
-
-                byte writeVal = wantSwitchOnBoot ? (byte)((b & 0xFC) | 0x01) : (byte)(b & 0xFC);
-
-                var w = Wmi.InvokeWmiMethod(WmiAcpiLib2.Methods.Set_Data, (byte)0xD1, new byte[] { writeVal });
-                if (!w.InvokeMethodResult || w.Flag != 1)
-                {
-                    errorMsg = "写入 EC 0xD1 失败（请确保以管理员身份运行）。";
-                    return false;
-                }
-
-                var rVerify = Wmi.InvokeWmiMethod(WmiAcpiLib2.Methods.Get_AP, (byte)0, null);
-                if (rVerify.InvokeMethodResult && rVerify.Flag == 1 && rVerify.Data != null && rVerify.Data.Length > 1)
-                {
-                    bool latchAfter = (rVerify.Data[1] & 0x03) != 0;
-                    if (latchAfter != wantSwitchOnBoot)
-                    {
-                        errorMsg = "EC 0xD1 状态未更新（请以管理员身份运行）。";
-                        return false;
-                    }
-                }
-
-                try
-                {
-                    using (RegistryKey baseKey = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry32))
-                    using (RegistryKey gsKey = baseKey.OpenSubKey(@"SOFTWARE\MSI\MSI Center\Component\Base Module\GeneralSetting", true))
-                    {
-                        if (gsKey != null)
-                        {
-                            gsKey.SetValue("GPU_Switch", toDiscrete ? 0 : 1, RegistryValueKind.DWord);
-                        }
-                    }
-                }
-                catch { }
-
-                if (wasDiffBefore != wantSwitchOnBoot)
-                {
-                    ToggleUefiGpuVariableFast();
-                }
-                return true;
-            }
-            catch (Exception ex)
-            {
-                errorMsg = ex.Message;
-                return false;
-            }
+            result.Ok = true;
+            return result;
         }
 
         public static void ReadTelemetry(out int cpuTemp, out int gpuTemp, out int cpuRpm, out int gpuRpm)
@@ -1274,57 +1392,59 @@ namespace MsiScenarioLite
         {
             if (isBusySwitching) return;
 
-            bool effectiveBefore = stagedIsDiscrete.HasValue ? stagedIsDiscrete.Value : currentIsDiscrete;
-            bool wasDiffBefore = (effectiveBefore != currentIsDiscrete);
+            // What the firmware will boot into next (authoritative, persisted).
+            bool encoded = stagedIsDiscrete.HasValue ? stagedIsDiscrete.Value : currentIsDiscrete;
 
-            if (targetDiscrete == effectiveBefore)
+            if (targetDiscrete == encoded)
             {
-                if (wasDiffBefore)
+                if (encoded != currentIsDiscrete)
                 {
-                    txtEcStatus.Text = string.Format("📌 当前已标记下次重启切换为【{0}】（点击另一侧可取消预约并恢复当前模式）。", targetDiscrete ? "独显直连" : "混合输出");
+                    txtEcStatus.Text = string.Format("📌 已标记下次重启切换为【{0}】（点击当前运行的那一侧可取消预约）。", targetDiscrete ? "独显直连" : "混合输出");
                 }
                 else
                 {
-                    txtEcStatus.Text = string.Format("● 当前硬件正处于【{0}】模式。", targetDiscrete ? "独显直连" : "混合输出");
+                    txtEcStatus.Text = string.Format("● 当前硬件正处于【{0}】模式，无需切换。", targetDiscrete ? "独显直连" : "混合输出");
                 }
                 return;
             }
 
-            // Immediately start center loading spinner AND slide the highlight pill so user gets instant visual feedback!
+            // Immediate visual feedback, then do the (fast) firmware write off the UI thread.
             SetCenterLoadingState(true);
             stagedIsDiscrete = targetDiscrete;
             UpdateGpuVisuals(currentIsDiscrete, stagedIsDiscrete, true);
-            txtEcStatus.Text = "⏳ 正在写入微星 EC 0xD1 与主板 UEFI NVRAM 标记...";
+            txtEcStatus.Text = "⏳ 正在写入主板 UEFI 变量 MsiDCVarData 与 EC 0xD1...";
 
-            string err = null;
-            bool ok = await Task.Run(() =>
+            EcHardwareController.GpuApplyResult result = await Task.Run(() =>
             {
-                // Ensure spinner is visible for at least 260ms so the transition feels deliberate and smooth
                 Stopwatch sw = Stopwatch.StartNew();
-                bool res = EcHardwareController.StageGpuModeForNextBoot(targetDiscrete, wasDiffBefore, out err);
+                EcHardwareController.GpuApplyResult res =
+                    EcHardwareController.ApplyGpuTarget(targetDiscrete, currentIsDiscrete, encoded);
+
                 int remain = 260 - (int)sw.ElapsedMilliseconds;
                 if (remain > 0) System.Threading.Thread.Sleep(remain);
                 return res;
             });
 
             SetCenterLoadingState(false);
-            RefreshHardwareState(false);
 
-            if (ok)
+            if (!result.Ok)
             {
-                string targetName = targetDiscrete ? "独显直连 (Discrete)" : "混合输出 (MSHybrid)";
-                if (targetDiscrete == currentIsDiscrete)
-                {
-                    txtEcStatus.Text = string.Format("✓ 已取消切换预约，恢复保持当前【{0}】模式（EC 0xD1 与 UEFI 已还原）。", targetName);
-                }
-                else
-                {
-                    txtEcStatus.Text = string.Format("📌 已打好【{0}】硬件与 BIOS 标记！无需现在重启，下次重启电脑时自动生效。", targetName);
-                }
+                // Roll the UI back to the real state instead of leaving a wrong pill.
+                stagedIsDiscrete = encoded;
+                RefreshHardwareState(false);
+                txtEcStatus.Text = "⚠️ " + result.Error;
+                return;
+            }
+
+            RefreshHardwareState(false);
+            string targetName = targetDiscrete ? "独显直连 (Discrete)" : "混合输出 (MSHybrid)";
+            if (targetDiscrete == currentIsDiscrete)
+            {
+                txtEcStatus.Text = string.Format("✓ 已取消切换预约，恢复保持当前【{0}】模式（UEFI 变量已还原）。", targetName);
             }
             else
             {
-                txtEcStatus.Text = "⚠️ " + err;
+                txtEcStatus.Text = string.Format("📌 已写入【{0}】标记（UEFI 已校验），下次正常重启后生效。", targetName);
             }
         }
 
@@ -1339,6 +1459,13 @@ namespace MsiScenarioLite
                 if (hwStaged.HasValue)
                 {
                     stagedIsDiscrete = hwStaged.Value;
+
+                    // After a reboot the staged target equals the running mode; collapse it
+                    // so the pill never claims a pending switch that already happened.
+                    if (stagedIsDiscrete.Value == currentIsDiscrete)
+                    {
+                        EcHardwareController.SavePersistedGpuTarget(currentIsDiscrete);
+                    }
                 }
 
                 int cpuT, gpuT, cpuRpm, gpuRpm;

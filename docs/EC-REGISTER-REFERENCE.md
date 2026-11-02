@@ -111,24 +111,50 @@ pending ? (current == Discrete ? 目标为 MSHybrid : 目标为 Discrete)
         : current
 ```
 
-### 4.4 UEFI 变量
+### 4.4 UEFI 变量（实测校正）
 
 | 项 | 值 |
 | :--- | :--- |
 | 变量名 | `MsiDCVarData` |
 | GUID | `{DD96BAAF-145E-4F56-B1CF-193256298E99}` |
-| 关键字节 | `buffer[58]`：`0` / `1` 之间翻转 |
+| 数据长度 | **20 字节**（不是 72，也不是 4096） |
+| 关键字节 | **`buffer[0]`**：`0` / `1`，决定下次开机使用的 MUX 模式 |
+| 权限 | `SeSystemEnvironmentPrivilege`（管理员令牌中默认禁用，需要 `AdjustTokenPrivileges` 显式开启） |
 
-`ResetUEFIVariable.exe` 是**盲翻转**（读取 → 取反 → 写回）。因此只在"预约状态发生翻转"时调用一次，否则会把标记改回去。
-
-直接 P/Invoke 更快（避免启动子进程）：
+**不要**通过 `UEFIVaribleDll.dll` 的旧式导出调用：该 DLL 实际只导出 `GetUEFIVariableEx` / `SetUEFIVariableEx`，名字与签名都和 `GetVariable` / `SetVariable` 不同。直接调用 `kernel32` 更稳：
 
 ```csharp
-[DllImport("UEFIVaribleDll.dll", CharSet = CharSet.Unicode)]
-static extern bool GetVariable(string name, string guid, byte[] buffer);
-[DllImport("UEFIVaribleDll.dll", CharSet = CharSet.Unicode)]
-static extern bool SetVariable(string name, string guid, byte[] buffer, int size);
+[DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+static extern uint GetFirmwareEnvironmentVariableW(string name, string guid, byte[] buffer, uint size);
+
+[DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+static extern bool SetFirmwareEnvironmentVariableW(string name, string guid, byte[] buffer, uint size);
 ```
+
+读 → 改 `buffer[0]` → 写回同一长度 → **再次读取校验**。示例（本机实测）：
+
+```text
+size=20 byte[0]=1            # 当前为混合输出
+set 0 -> ok=True             # 目标：独显直连
+after set: size=20 byte[0]=0
+```
+
+> ⚠️ 早期版本的 `MSI Scenario Lite` 误把关键字节写成 `buffer[58]`、写入长度写成 72，且 P/Invoke 入口点名字错误（`CheckPrivileges` / `GetVariable` / `SetVariable` 在 DLL 中并不存在），导致每次都静默回退到 `ResetUEFIVariable.exe` 的盲翻转。该路径已删除，改为上面的显式读写 + 校验。
+
+### 4.5 为什么不能依赖 EC 0xD1 判断"是否已预约切换"
+
+`ResetUEFIVariable.exe`（或显式写变量）执行后，EC 的 `0xD1` 低两位会被固件清掉。实测日志：
+
+```text
+applied current=Hybrid target=Discrete uefi 1->0 size=20 latch=0x05
+# 稍后再次读取 Get_AP(0).Data[1] 已经不再是"pending"状态
+```
+
+因此**不要**用 `0xD1` 回读值推断"是否还有未生效的切换"。正确做法：
+
+1. 自己持久化"下次启动目标模式"（例如 `%LOCALAPPDATA%\MsiScenarioLite\gpu-target.txt`）；
+2. 以持久化值为准，`0xD1` 只作为"外部（如 MSI Center）刚发起切换"的辅助信号；
+3. 每次写入后回读 UEFI 变量校验，并记录日志。
 
 ---
 
