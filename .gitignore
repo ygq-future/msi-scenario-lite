@@ -1,0 +1,22 @@
+# Build outputs
+*.exe
+*.pdb
+*.obj
+bin/
+obj/
+
+# MSI proprietary binaries (copied locally by tools/Prepare-Dependencies.ps1)
+MSIWMIACPI2.dll
+ResetUEFIVariable.exe
+UEFIVaribleDll.dll
+
+# Local/editor noise
+.vs/
+.vscode/
+*.user
+*.suo
+Thumbs.db
+desktop.ini
+
+# Internal reverse-engineering notes (never published)
+DEV-NOTES.md
