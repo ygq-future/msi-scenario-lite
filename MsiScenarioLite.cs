@@ -515,13 +515,13 @@ namespace MsiScenarioLite
         {
             if (modeCode == 0xC4 || modeCode == 0xC0)
             {
-                return includeCoolerBoost ? "游戏模式 + 强冷 (0xC4)" : "游戏模式 (0xC4)";
+                return includeCoolerBoost ? "游戏模式 + 强冷" : "游戏模式";
             }
             if (modeCode == 0xC2 || modeCode == 0xC3)
             {
-                return "节能静音模式 (0xC2)";
+                return "节能静音模式";
             }
-            return "均衡模式 (0xC1)";
+            return "均衡模式";
         }
 
         public static void ReadTelemetry(out int cpuTemp, out int gpuTemp, out int cpuRpm, out int gpuRpm)
@@ -917,7 +917,7 @@ namespace MsiScenarioLite
             }
             else
             {
-                txtEcStatus.Text = "● 已关闭【启动时恢复上次场景】（重启后硬件默认恢复为均衡模式 0xC1）";
+                txtEcStatus.Text = "● 已关闭【启动时恢复上次场景】（重启后硬件默认恢复为均衡模式）";
             }
             RefreshHardwareState(false);
         }
@@ -947,7 +947,7 @@ namespace MsiScenarioLite
             }
             if (txtGamingSub != null)
             {
-                txtGamingSub.Text = on ? "极致性能 + 自动强冷 (0xC4)" : "极致性能 + 自动温控 (0xC4)";
+                txtGamingSub.Text = on ? "极致性能 + 自动强冷" : "极致性能 + 自动温控";
             }
             if (menuGaming != null)
             {
@@ -1394,7 +1394,7 @@ namespace MsiScenarioLite
             };
             TextBlock lblScenarioSub = new TextBlock
             {
-                Text = "EC 直写 · 重启默认恢复均衡模式 (0xC1)",
+                Text = "EC 直写 · 重启默认恢复均衡模式",
                 Foreground = new SolidColorBrush(Color.FromRgb(132, 144, 180)),
                 FontSize = 11.5,
                 Margin = new Thickness(10, 3, 0, 0),
@@ -1456,7 +1456,7 @@ namespace MsiScenarioLite
                 Padding = new Thickness(9, 5, 9, 5),
                 Margin = new Thickness(0, 0, 7, 0),
                 Cursor = Cursors.Hand,
-                ToolTip = "主板 EC 在每次重启后默认重置为均衡模式 (0xC1)。开启此项后，每次启动本软件时将自动重新下发上次保存的场景模式。"
+                ToolTip = "主板 EC 在每次重启后默认重置为均衡模式。开启此项后，每次启动本软件时将自动重新下发上次保存的场景模式。"
             };
             StackPanel arStack = new StackPanel { Orientation = Orientation.Horizontal };
             dotAutoRestoreScenario = new Ellipse
@@ -1536,7 +1536,7 @@ namespace MsiScenarioLite
 
             cardGaming = CreateScenarioCard(
                 "游戏模式",
-                gamingAutoCoolerBoostEnabled ? "极致性能 + 自动强冷 (0xC4)" : "极致性能 + 自动温控 (0xC4)",
+                gamingAutoCoolerBoostEnabled ? "极致性能 + 自动强冷" : "极致性能 + 自动温控",
                 "不限制 BIOS 功耗上限并开启满速散热",
                 "extreme.png",
                 out badgeGaming,
@@ -1545,7 +1545,7 @@ namespace MsiScenarioLite
 
             cardBalanced = CreateScenarioCard(
                 "均衡模式",
-                "日常均衡 + 自动温控 (0xC1)",
+                "日常均衡 + 自动温控",
                 "自动温控风扇 · 动静皆宜",
                 "balanced.png",
                 out badgeBalanced,
@@ -1553,7 +1553,7 @@ namespace MsiScenarioLite
 
             cardSilent = CreateScenarioCard(
                 "节能静音模式",
-                "低噪静音 + 自动温控 (0xC2)",
+                "低噪静音 + 自动温控",
                 "轻载低频低噪 · 专注办公",
                 "silent.png",
                 out badgeSilent,
