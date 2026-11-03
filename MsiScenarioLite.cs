@@ -635,7 +635,7 @@ namespace MsiScenarioLite
         private bool? stagedIsDiscrete = null;
         private bool? lastAnimatedDiscrete = null;
 
-        public MainWindow(bool startMinimized)
+        public MainWindow()
         {
             try { SetCurrentProcessExplicitAppUserModelID("MsiScenarioLite.PureEcControl.1"); }
             catch { }
@@ -662,10 +662,6 @@ namespace MsiScenarioLite
             SourceInitialized += (s, e) =>
             {
                 ApplyNativeWindowStyleAndIcons(icoPath);
-                if (startMinimized)
-                {
-                    Hide();
-                }
             };
             Loaded += (s, e) => ApplyNativeWindowStyleAndIcons(icoPath);
             StateChanged += (s, e) =>
@@ -927,7 +923,11 @@ namespace MsiScenarioLite
                     trayIcon.Dispose();
                     trayIcon = null;
                 }
-                Close();
+                if (new WindowInteropHelper(this).Handle != IntPtr.Zero)
+                {
+                    Close();
+                }
+                Application.Current.Shutdown();
             });
             menu.MenuItems.Add(menuExit);
 
@@ -2159,7 +2159,21 @@ namespace MsiScenarioLite
             }
 
             Application app = new Application();
-            app.Run(new MainWindow(startMinimized));
+            app.ShutdownMode = ShutdownMode.OnExplicitShutdown;
+
+            // Autostart (-m) must not show the window at all: WPF's Application.Run(window)
+            // always performs a first Show(), and hiding from SourceInitialized/Loaded leaves a
+            // visible but never-rendered black window. Running the dispatcher without a window
+            // keeps the tray icon + EC polling alive until the user opens or exits the app.
+            MainWindow window = new MainWindow();
+            if (startMinimized)
+            {
+                app.Run();
+            }
+            else
+            {
+                app.Run(window);
+            }
             return 0;
         }
     }
