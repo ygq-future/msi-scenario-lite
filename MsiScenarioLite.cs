@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Reflection;
@@ -66,20 +67,25 @@ namespace MsiScenarioLite
             return 0xC1;
         }
 
-        public static bool WriteShiftMode(byte modeCode, bool enableCoolerBoost, out string syncStatus)
+        public static bool WriteShiftMode(byte modeCode, bool? enableCoolerBoost, out string syncStatus)
         {
             // 1. Write target Shift Mode into EC 0xD2 (0xC4 = Gaming/Extreme, 0xC1 = Balanced, 0xC2 = Silent/ECO)
             // Strictly avoids writing EC 0x50 (PL1) or 0x51 (PL2)
             var rShift = Wmi.InvokeWmiMethod(WmiAcpiLib2.Methods.Set_Data, (byte)0xD2, new byte[] { modeCode });
             bool ok = rShift.InvokeMethodResult && rShift.Flag == 1;
 
-            // 2. Update Cooler Boost bit (bit 7 of Get_Thermal(3) written to EC 0x98)
-            SetCoolerBoost(enableCoolerBoost);
-
-            // 3. Ensure EC Auto Fan bit (EC 0xD4 bit 7 = 0) when CoolerBoost is off
-            if (!enableCoolerBoost)
+            // 2. Update Cooler Boost bit (bit 7 of Get_Thermal(3) written to EC 0x98).
+            // A null value means "leave the current fan policy untouched" (gaming mode with
+            // its per-card auto-boost switch disabled).
+            if (enableCoolerBoost.HasValue)
             {
-                EnsureAutoFan();
+                SetCoolerBoost(enableCoolerBoost.Value);
+
+                // 3. Ensure EC Auto Fan bit (EC 0xD4 bit 7 = 0) when CoolerBoost is off
+                if (!enableCoolerBoost.Value)
+                {
+                    EnsureAutoFan();
+                }
             }
 
             if (ok)
@@ -148,6 +154,32 @@ namespace MsiScenarioLite
                 System.IO.File.WriteAllText(
                     System.IO.Path.Combine(StateDir, "last-scenario.txt"),
                     string.Format("0x{0:X2}", modeCode));
+            }
+            catch { }
+        }
+
+        public static bool LoadGamingAutoCoolerBoost()
+        {
+            try
+            {
+                string path = System.IO.Path.Combine(StateDir, "gaming-auto-cooler-boost.txt");
+                if (!System.IO.File.Exists(path)) return true;
+                return System.IO.File.ReadAllText(path).Trim() == "1";
+            }
+            catch
+            {
+                return true;
+            }
+        }
+
+        public static void SaveGamingAutoCoolerBoost(bool enabled)
+        {
+            try
+            {
+                System.IO.Directory.CreateDirectory(StateDir);
+                System.IO.File.WriteAllText(
+                    System.IO.Path.Combine(StateDir, "gaming-auto-cooler-boost.txt"),
+                    enabled ? "1" : "0");
             }
             catch { }
         }
@@ -595,6 +627,21 @@ namespace MsiScenarioLite
         private Ellipse dotAutoRestoreScenario;
         private bool autoRestoreScenarioEnabled = false;
 
+        // Per-card button on the gaming scenario: auto-enable Cooler Boost when entering gaming.
+        private bool gamingAutoCoolerBoostEnabled = true;
+        private Border btnGamingAutoBoost;
+        private Ellipse dotGamingAutoBoost;
+        private TextBlock txtGamingAutoBoostLabel;
+        private TextBlock txtGamingSub;
+
+        private Grid bgHost;
+        private Image iconGaming;
+        private Image iconBalanced;
+        private Image iconSilent;
+        private ModeTraceLayer[] modeBgLayers;
+        private int activeModeBgIndex = -1;
+        private const double ModeBgOpacity = 0.55;
+
         private Border btnCoolerBoost;
         private TextBlock txtCoolerBoostState;
         private Ellipse dotCoolerBoost;
@@ -663,17 +710,23 @@ namespace MsiScenarioLite
             {
                 ApplyNativeWindowStyleAndIcons(icoPath);
             };
-            Loaded += (s, e) => ApplyNativeWindowStyleAndIcons(icoPath);
+            Loaded += (s, e) =>
+            {
+                ApplyNativeWindowStyleAndIcons(icoPath);
+                UpdateModeBackgroundCenters();
+            };
             StateChanged += (s, e) =>
             {
                 if (WindowState == WindowState.Normal) ApplyNativeWindowStyleAndIcons(icoPath);
             };
 
             autoRestoreScenarioEnabled = EcHardwareController.LoadAutoRestoreScenarioEnabled();
+            gamingAutoCoolerBoostEnabled = EcHardwareController.LoadGamingAutoCoolerBoost();
             lastStartupState = EcHardwareController.ReadWindowsStartupState();
 
             BuildUI();
             InitSystemTray(icoPath);
+            UpdateGamingAutoBoostToggle();
 
             string startupRestoreMsg = TryAutoRestoreScenarioOnStartup();
             RefreshHardwareState(false);
@@ -835,12 +888,20 @@ namespace MsiScenarioLite
             byte current = EcHardwareController.ReadShiftByte();
             if (current == saved.Value) return null;
 
-            bool boost = (saved.Value == 0xC4);
+            bool? boost = null;
+            if (saved.Value != 0xC4)
+            {
+                boost = false;
+            }
+            else if (gamingAutoCoolerBoostEnabled)
+            {
+                boost = true;
+            }
             string syncState;
             bool ok = EcHardwareController.WriteShiftMode(saved.Value, boost, out syncState);
             if (!ok) return null;
 
-            string modeName = EcHardwareController.FormatScenarioLabel(saved.Value, true);
+            string modeName = EcHardwareController.FormatScenarioLabel(saved.Value, EcHardwareController.ReadCoolerBoost());
             return string.Format("✓ 启动已自动恢复上次【{0}】| MSI Center:{1}", modeName, syncState);
         }
 
@@ -859,6 +920,122 @@ namespace MsiScenarioLite
                 txtEcStatus.Text = "● 已关闭【启动时恢复上次场景】（重启后硬件默认恢复为均衡模式 0xC1）";
             }
             RefreshHardwareState(false);
+        }
+
+        private void ToggleGamingAutoCoolerBoost()
+        {
+            gamingAutoCoolerBoostEnabled = !gamingAutoCoolerBoostEnabled;
+            EcHardwareController.SaveGamingAutoCoolerBoost(gamingAutoCoolerBoostEnabled);
+            UpdateGamingAutoBoostToggle();
+
+            txtEcStatus.Text = gamingAutoCoolerBoostEnabled
+                ? "✓ 已开启【自动强冷】：切换到游戏模式时会同时开启强冷风扇。"
+                : "● 已关闭【自动强冷】：切换到游戏模式时保持当前风扇策略。";
+        }
+
+        private void UpdateGamingAutoBoostToggle()
+        {
+            bool on = gamingAutoCoolerBoostEnabled;
+
+            if (btnGamingAutoBoost != null)
+            {
+                btnGamingAutoBoost.BorderBrush = new SolidColorBrush(on ? Color.FromRgb(235, 55, 82) : Color.FromRgb(58, 70, 114));
+                btnGamingAutoBoost.Background = new SolidColorBrush(on ? Color.FromRgb(48, 24, 42) : Color.FromRgb(25, 31, 56));
+                dotGamingAutoBoost.Fill = new SolidColorBrush(on ? Color.FromRgb(255, 70, 95) : Color.FromRgb(110, 120, 150));
+                txtGamingAutoBoostLabel.Text = on ? "自动强冷: 开" : "自动强冷: 关";
+                txtGamingAutoBoostLabel.Foreground = on ? Brushes.White : new SolidColorBrush(Color.FromRgb(185, 196, 228));
+            }
+            if (txtGamingSub != null)
+            {
+                txtGamingSub.Text = on ? "极致性能 + 自动强冷 (0xC4)" : "极致性能 + 自动温控 (0xC4)";
+            }
+            if (menuGaming != null)
+            {
+                menuGaming.Text = on ? "游戏模式 (极致性能 + 自动开启强冷)" : "游戏模式 (极致性能 + 自动温控风扇)";
+            }
+        }
+
+        private void UpdateModeBackground(int index, bool animate)
+        {
+            if (modeBgLayers == null || index < 0 || index >= modeBgLayers.Length) return;
+            if (modeBgLayers[index] == null || index == activeModeBgIndex) return;
+
+            int oldIndex = activeModeBgIndex;
+            activeModeBgIndex = index;
+            ModeTraceLayer incoming = modeBgLayers[index];
+            Panel.SetZIndex(incoming, 1);
+            if (oldIndex >= 0 && modeBgLayers[oldIndex] != null)
+            {
+                Panel.SetZIndex(modeBgLayers[oldIndex], 0);
+            }
+
+            if (!animate)
+            {
+                for (int i = 0; i < modeBgLayers.Length; i++)
+                {
+                    ModeTraceLayer layer = modeBgLayers[i];
+                    if (layer == null) continue;
+                    layer.BeginAnimation(UIElement.OpacityProperty, null);
+                    layer.Opacity = (i == index) ? ModeBgOpacity : 0.0;
+                }
+                return;
+            }
+
+            CubicEase ease = new CubicEase { EasingMode = EasingMode.EaseInOut };
+            incoming.BeginAnimation(
+                UIElement.OpacityProperty,
+                new DoubleAnimation(ModeBgOpacity, TimeSpan.FromMilliseconds(380)) { EasingFunction = ease });
+            incoming.PlayPulse();
+
+            if (oldIndex >= 0 && oldIndex != index && modeBgLayers[oldIndex] != null)
+            {
+                modeBgLayers[oldIndex].BeginAnimation(
+                    UIElement.OpacityProperty,
+                    new DoubleAnimation(0.0, TimeSpan.FromMilliseconds(380)) { EasingFunction = ease });
+            }
+        }
+
+        private void UpdateModeBackgroundCenters()
+        {
+            if (bgHost == null || modeBgLayers == null) return;
+            double width = bgHost.ActualWidth;
+            double height = bgHost.ActualHeight;
+            if (width <= 0 || height <= 0) return;
+
+            Image[] icons = { iconGaming, iconBalanced, iconSilent };
+
+            // Alpha bounds of the three 192px icon PNGs, scaled to the 82px Image control,
+            // plus a 4px breathing gap. Offsets move the trace origin to the glyph's centre
+            // instead of the transparent image box centre.
+            double[] halfX = { 32.2, 43.3, 24.3 };
+            double[] halfY = { 29.0, 30.5, 30.9 };
+            double[] offsetX = { 0.0, 0.0, 0.6 };
+            double[] offsetY = { 3.6, -1.7, -1.3 };
+
+            for (int i = 0; i < icons.Length && i < modeBgLayers.Length; i++)
+            {
+                if (icons[i] == null || modeBgLayers[i] == null) continue;
+                Point center = icons[i].TranslatePoint(
+                    new Point(icons[i].ActualWidth / 2.0, icons[i].ActualHeight / 2.0),
+                    bgHost);
+                center = new Point(center.X + offsetX[i], center.Y + offsetY[i]);
+                modeBgLayers[i].Build(center, 1301 + i * 97, width, height, halfX[i], halfY[i]);
+            }
+        }
+
+        private static Image FindCardIcon(DependencyObject root)
+        {
+            if (root == null) return null;
+            int count = VisualTreeHelper.GetChildrenCount(root);
+            for (int i = 0; i < count; i++)
+            {
+                DependencyObject child = VisualTreeHelper.GetChild(root, i);
+                Image image = child as Image;
+                if (image != null) return image;
+                Image found = FindCardIcon(child);
+                if (found != null) return found;
+            }
+            return null;
         }
 
         private void InitSystemTray(string icoPath)
@@ -886,7 +1063,9 @@ namespace MsiScenarioLite
             menu.MenuItems.Add(menuOpen);
             menu.MenuItems.Add("-");
 
-            menuGaming = new WinForms.MenuItem("游戏模式 (极致性能 + 自动开启强冷)", (s, e) => ApplyScenarioAsync(0xC4, true));
+            menuGaming = new WinForms.MenuItem(
+                gamingAutoCoolerBoostEnabled ? "游戏模式 (极致性能 + 自动开启强冷)" : "游戏模式 (极致性能 + 自动温控风扇)",
+                (s, e) => ApplyScenarioAsync(0xC4, gamingAutoCoolerBoostEnabled ? (bool?)true : null));
             menuBalanced = new WinForms.MenuItem("均衡模式 (日常均衡 + 自动温控风扇)", (s, e) => ApplyScenarioAsync(0xC1, false));
             menuSilent = new WinForms.MenuItem("节能静音模式 (低噪办公 + 自动温控风扇)", (s, e) => ApplyScenarioAsync(0xC2, false));
             menu.MenuItems.Add(menuGaming);
@@ -1082,42 +1261,16 @@ namespace MsiScenarioLite
             rootGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });     // Content (Auto-sized so top & bottom gaps are 100% symmetrical!)
             rootGrid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(32) }); // Bottom Status Bar
 
-            BitmapImage chipBmp = LoadAsset("chip_bg.png");
-            if (chipBmp != null)
+            bgHost = new Grid { IsHitTestVisible = false, ClipToBounds = true };
+            modeBgLayers = new ModeTraceLayer[3];
+            for (int i = 0; i < modeBgLayers.Length; i++)
             {
-                Image bgChip = new Image
-                {
-                    Source = chipBmp,
-                    Width = 240,
-                    Height = 240,
-                    HorizontalAlignment = HorizontalAlignment.Right,
-                    VerticalAlignment = VerticalAlignment.Top,
-                    Margin = new Thickness(0, 6, 12, 0),
-                    Opacity = 0.24,
-                    IsHitTestVisible = false
-                };
-                Grid.SetRowSpan(bgChip, 2);
-                rootGrid.Children.Add(bgChip);
-
-                // Mirror the same circuit motif on the left edge so the empty left half of the
-                // header/content band gets the same subtle tech texture as the right side.
-                // Horizontal flip keeps the two sides from reading as one repeated rectangle.
-                Image bgChipLeft = new Image
-                {
-                    Source = chipBmp,
-                    Width = 288,
-                    Height = 288,
-                    HorizontalAlignment = HorizontalAlignment.Left,
-                    VerticalAlignment = VerticalAlignment.Top,
-                    Margin = new Thickness(-24, 4, 0, 0),
-                    Opacity = 0.26,
-                    IsHitTestVisible = false,
-                    RenderTransformOrigin = new Point(0.5, 0.5),
-                    RenderTransform = new ScaleTransform(-1, 1)
-                };
-                Grid.SetRowSpan(bgChipLeft, 2);
-                rootGrid.Children.Add(bgChipLeft);
+                ModeTraceLayer layer = new ModeTraceLayer { Opacity = 0, IsHitTestVisible = false };
+                modeBgLayers[i] = layer;
+                bgHost.Children.Add(layer);
             }
+            Grid.SetRowSpan(bgHost, 3);
+            rootGrid.Children.Add(bgHost);
 
             // ================= 1. TOP BAR =================
             Border topBarBorder = new Border
@@ -1383,11 +1536,12 @@ namespace MsiScenarioLite
 
             cardGaming = CreateScenarioCard(
                 "游戏模式",
-                "极致性能 + 自动强冷 (0xC4)",
+                gamingAutoCoolerBoostEnabled ? "极致性能 + 自动强冷 (0xC4)" : "极致性能 + 自动温控 (0xC4)",
                 "不限制 BIOS 功耗上限并开启满速散热",
                 "extreme.png",
                 out badgeGaming,
-                () => ApplyScenarioAsync(0xC4, true));
+                () => ApplyScenarioAsync(0xC4, gamingAutoCoolerBoostEnabled ? (bool?)true : null),
+                true);
 
             cardBalanced = CreateScenarioCard(
                 "均衡模式",
@@ -1411,6 +1565,10 @@ namespace MsiScenarioLite
             cardsGrid.Children.Add(cardGaming);
             cardsGrid.Children.Add(cardBalanced);
             cardsGrid.Children.Add(cardSilent);
+
+            iconGaming = FindCardIcon(cardGaming);
+            iconBalanced = FindCardIcon(cardBalanced);
+            iconSilent = FindCardIcon(cardSilent);
 
             Grid.SetRow(cardsGrid, 1);
             contentGrid.Children.Add(cardsGrid);
@@ -1722,7 +1880,7 @@ namespace MsiScenarioLite
             return btn;
         }
 
-        private Border CreateScenarioCard(string title, string sub, string desc, string iconName, out TextBlock stateBadge, Action onClick)
+        private Border CreateScenarioCard(string title, string sub, string desc, string iconName, out TextBlock stateBadge, Action onClick, bool showGamingAutoBoostSwitch = false)
         {
             Border card = new Border
             {
@@ -1747,10 +1905,57 @@ namespace MsiScenarioLite
                 FontSize = 11,
                 FontWeight = FontWeights.Bold,
                 Foreground = new SolidColorBrush(Color.FromRgb(120, 132, 170)),
-                HorizontalAlignment = HorizontalAlignment.Right
+                HorizontalAlignment = HorizontalAlignment.Right,
+                VerticalAlignment = VerticalAlignment.Center
             };
             Grid.SetRow(stateBadge, 0);
             g.Children.Add(stateBadge);
+
+            if (showGamingAutoBoostSwitch)
+            {
+                // Compact pill matching the header toggles: dot + "自动强冷: 开/关".
+                // Marking the click handled keeps the card's scenario-switch handler from firing.
+                btnGamingAutoBoost = new Border
+                {
+                    HorizontalAlignment = HorizontalAlignment.Left,
+                    VerticalAlignment = VerticalAlignment.Center,
+                    Background = new SolidColorBrush(Color.FromRgb(25, 31, 56)),
+                    BorderBrush = new SolidColorBrush(Color.FromRgb(58, 70, 114)),
+                    BorderThickness = new Thickness(1),
+                    CornerRadius = new CornerRadius(7),
+                    Padding = new Thickness(8, 3, 8, 3),
+                    Cursor = Cursors.Hand,
+                    ToolTip = "进入游戏模式时是否自动开启强冷风扇"
+                };
+
+                StackPanel autoBoostPanel = new StackPanel { Orientation = Orientation.Horizontal };
+                dotGamingAutoBoost = new Ellipse
+                {
+                    Width = 7,
+                    Height = 7,
+                    Fill = new SolidColorBrush(Color.FromRgb(110, 120, 150)),
+                    VerticalAlignment = VerticalAlignment.Center,
+                    Margin = new Thickness(0, 0, 6, 0)
+                };
+                txtGamingAutoBoostLabel = new TextBlock
+                {
+                    Text = "自动强冷: 开",
+                    FontSize = 10.5,
+                    FontWeight = FontWeights.SemiBold,
+                    Foreground = new SolidColorBrush(Color.FromRgb(185, 196, 228)),
+                    VerticalAlignment = VerticalAlignment.Center
+                };
+                autoBoostPanel.Children.Add(dotGamingAutoBoost);
+                autoBoostPanel.Children.Add(txtGamingAutoBoostLabel);
+                btnGamingAutoBoost.Child = autoBoostPanel;
+                btnGamingAutoBoost.MouseLeftButtonDown += (s, e) =>
+                {
+                    e.Handled = true;
+                    ToggleGamingAutoCoolerBoost();
+                };
+                Grid.SetRow(btnGamingAutoBoost, 0);
+                g.Children.Add(btnGamingAutoBoost);
+            }
 
             BitmapImage bmp = LoadAsset(iconName);
             if (bmp != null)
@@ -1798,23 +2003,40 @@ namespace MsiScenarioLite
             Grid.SetRow(bottomStack, 2);
             g.Children.Add(bottomStack);
 
+            if (showGamingAutoBoostSwitch)
+            {
+                txtGamingSub = lblSub;
+                UpdateGamingAutoBoostToggle();
+            }
+
             card.Child = g;
             card.MouseLeftButtonDown += (s, e) => onClick();
             return card;
         }
 
-        private async void ApplyScenarioAsync(byte shiftCode, bool coolerBoost)
+        private async void ApplyScenarioAsync(byte shiftCode, bool? coolerBoost)
         {
             if (isBusySwitching) return;
             isBusySwitching = true;
 
             string syncState = "";
+            int previousBgIndex = activeModeBgIndex;
             bool ok = await Task.Run(() => EcHardwareController.WriteShiftMode(shiftCode, coolerBoost, out syncState));
 
             isBusySwitching = false;
             RefreshHardwareState(true);
 
-            string modeName = EcHardwareController.FormatScenarioLabel(shiftCode, true);
+            int targetBgIndex = shiftCode == 0xC4 ? 0 : (shiftCode == 0xC2 ? 2 : 1);
+            if (ok && modeBgLayers != null && previousBgIndex == targetBgIndex &&
+                targetBgIndex >= 0 && targetBgIndex < modeBgLayers.Length &&
+                modeBgLayers[targetBgIndex] != null)
+            {
+                // Re-clicking the already active card does not change the mode, so the
+                // crossfade path in RefreshHardwareState stays idle. Replay the wave here.
+                modeBgLayers[targetBgIndex].PlayPulse();
+            }
+
+            string modeName = EcHardwareController.FormatScenarioLabel(shiftCode, currentCoolerBoost);
             if (ok)
             {
                 txtEcStatus.Text = string.Format("✓ 已切换【{0}】| EC 0xD2=0x{1:X2} | MSI Center:{2}",
@@ -1913,12 +2135,15 @@ namespace MsiScenarioLite
                     new Point(1, 1));
                 Brush inactiveBorder = new SolidColorBrush(Color.FromRgb(42, 50, 82));
 
-                Brush activeBg = new SolidColorBrush(Color.FromArgb(245, 30, 36, 66));
-                Brush inactiveBg = new SolidColorBrush(Color.FromArgb(195, 20, 24, 42));
+                Brush activeBg = new SolidColorBrush(Color.FromArgb(150, 30, 36, 66));
+                Brush inactiveBg = new SolidColorBrush(Color.FromArgb(160, 20, 24, 42));
 
                 bool isGaming = (currentShiftByte == 0xC4 || currentShiftByte == 0xC0);
                 bool isSilent = (currentShiftByte == 0xC2 || currentShiftByte == 0xC3);
                 bool isBalanced = !isGaming && !isSilent;
+
+                int bgIndex = isGaming ? 0 : (isSilent ? 2 : 1);
+                UpdateModeBackground(bgIndex, activeModeBgIndex >= 0);
 
                 ApplyCardStyle(cardGaming, badgeGaming, isGaming, activeBorder, inactiveBorder, activeBg, inactiveBg, animate);
                 ApplyCardStyle(cardBalanced, badgeBalanced, isBalanced, activeBorder, inactiveBorder, activeBg, inactiveBg, animate);
@@ -2137,6 +2362,604 @@ namespace MsiScenarioLite
                 lblHybridTitle.Foreground = Brushes.White;
                 lblHybridTitle.Text = isStagedDiff ? "📌 混合输出 (已标记·重启生效)" : "● 混合输出 (当前生效)";
             }
+        }
+    }
+
+    /// <summary>
+    /// Sparse vector circuit traces that start just outside a scenario icon and fan outward.
+    /// Drawn in code so the empty centre is aligned to the exact icon position; a one-shot
+    /// light wave travels along the traces when the scenario changes, then the layer is idle.
+    /// </summary>
+    internal sealed class ModeTraceLayer : Canvas
+    {
+        private sealed class TraceSpec
+        {
+            public PathGeometry Geometry;
+            public double Length;
+        }
+
+        private sealed class PulseSpec
+        {
+            public System.Windows.Shapes.Path Core;
+            public System.Windows.Shapes.Path Glow;
+            public double Length;
+            public double DelayMs;
+        }
+
+        private List<PulseSpec> pulseSpecs = new List<PulseSpec>();
+        private Ellipse waveRing;
+        private ScaleTransform waveScale;
+        private System.Windows.Shapes.Path breathCore;
+        private System.Windows.Shapes.Path breathGlow;
+        private const double PulseDashPx = 18.0;
+        private const double PulseCoreThickness = 1.0;
+        private const double PulseGlowThickness = 2.8;
+
+        public ModeTraceLayer()
+        {
+            ClipToBounds = true;
+            IsHitTestVisible = false;
+        }
+
+        public void Build(Point center, int seed, double width, double height, double iconHalfX, double iconHalfY)
+        {
+            Children.Clear();
+            Random rnd = new Random(seed);
+
+            GeometryGroup baseGeom = new GeometryGroup();
+            GeometryGroup accentGeom = new GeometryGroup();
+            List<Point> vias = new List<Point>();
+            List<bool> viaAccent = new List<bool>();
+            List<TraceSpec> traceSpecs = new List<TraceSpec>();
+            pulseSpecs.Clear();
+
+            // Restored layout: three traces per icon side, mirrored around the glyph centre.
+            // This is the symmetric fan from the version with the four triangular structures;
+            // the pulse and breathing effects remain the current ones.
+            double spanX = Math.Max(10.0, iconHalfX * 0.85);
+            double spanY = Math.Max(10.0, iconHalfY * 0.85);
+
+            for (int side = 0; side < 4; side++)
+            {
+                for (int k = 0; k < 3; k++)
+                {
+                    double alongX = (k - 1) * spanX;
+                    double alongY = (k - 1) * spanY;
+                    Point start;
+                    double ox, oy, lx, ly;
+
+                    if (side == 0)
+                    {
+                        start = new Point(center.X + alongX, center.Y - iconHalfY);
+                        ox = 0; oy = -1; lx = 1; ly = 0;
+                    }
+                    else if (side == 1)
+                    {
+                        start = new Point(center.X + iconHalfX, center.Y + alongY);
+                        ox = 1; oy = 0; lx = 0; ly = 1;
+                    }
+                    else if (side == 2)
+                    {
+                        start = new Point(center.X + alongX, center.Y + iconHalfY);
+                        ox = 0; oy = 1; lx = 1; ly = 0;
+                    }
+                    else
+                    {
+                        start = new Point(center.X - iconHalfX, center.Y + alongY);
+                        ox = -1; oy = 0; lx = 0; ly = 1;
+                    }
+
+                    int lateralDir = k - 1;
+                    if (lateralDir == 0)
+                    {
+                        lateralDir = rnd.Next(2) == 0 ? -1 : 1;
+                    }
+                    double sx = lx * lateralDir;
+                    double sy = ly * lateralDir;
+
+                    PathGeometry geo = new PathGeometry();
+                    PathFigure figure = new PathFigure { StartPoint = start, IsFilled = false, IsClosed = false };
+                    Point current = start;
+
+                    AddSegment(figure, ref current, ox * 14, oy * 14);
+                    AddSegment(figure, ref current, ox * 26 + sx * 26, oy * 26 + sy * 26);
+                    double longRun = 55 + rnd.NextDouble() * 95;
+                    AddSegment(figure, ref current, ox * longRun, oy * longRun);
+                    double secondDiagonal = 18 + rnd.NextDouble() * 26;
+                    AddSegment(figure, ref current,
+                        ox * secondDiagonal + sx * secondDiagonal,
+                        oy * secondDiagonal + sy * secondDiagonal);
+                    double finalRun = 40 + rnd.NextDouble() * 120;
+                    AddSegment(figure, ref current, ox * finalRun, oy * finalRun);
+
+                    if (rnd.NextDouble() < 0.35)
+                    {
+                        double flick = 12 + rnd.NextDouble() * 22;
+                        int flickDir = rnd.Next(2) == 0 ? 1 : -1;
+                        AddSegment(figure, ref current,
+                            ox * flick + lx * flickDir * flick,
+                            oy * flick + ly * flickDir * flick);
+                    }
+
+                    Point viaPoint = current;
+                    const double overshoot = 12.0;
+                    if (side == 0)
+                    {
+                        double targetY = -overshoot;
+                        if (current.Y > targetY) AddSegment(figure, ref current, 0, targetY - current.Y);
+                    }
+                    else if (side == 1)
+                    {
+                        double targetX = width + overshoot;
+                        if (current.X < targetX) AddSegment(figure, ref current, targetX - current.X, 0);
+                    }
+                    else if (side == 2)
+                    {
+                        double targetY = height + overshoot;
+                        if (current.Y < targetY) AddSegment(figure, ref current, 0, targetY - current.Y);
+                    }
+                    else
+                    {
+                        double targetX = -overshoot;
+                        if (current.X > targetX) AddSegment(figure, ref current, targetX - current.X, 0);
+                    }
+
+                    geo.Figures.Add(figure);
+                    bool accent = (side == 1 && k == 2) || (side == 3 && k == 0);
+                    if (accent) accentGeom.Children.Add(geo);
+                    else baseGeom.Children.Add(geo);
+                    traceSpecs.Add(new TraceSpec { Geometry = geo, Length = GetFigureLength(figure) });
+                    vias.Add(viaPoint);
+                    viaAccent.Add(accent);
+                }
+            }
+
+            AddLine(baseGeom, Color.FromArgb(18, 70, 120, 210), 3.4);
+            AddLine(baseGeom, Color.FromArgb(112, 110, 140, 215), 0.85);
+            if (accentGeom.Children.Count > 0)
+            {
+                AddLine(accentGeom, Color.FromArgb(14, 90, 180, 240), 3.0);
+                AddLine(accentGeom, Color.FromArgb(92, 145, 210, 255), 0.8);
+            }
+
+            // Faint expanding ring: only an accompaniment. The primary effect is the
+            // per-trace light pulse travelling from the icon end to the far end.
+            double ringSize = Math.Max(width, height) * 1.3;
+            RadialGradientBrush ringBrush = new RadialGradientBrush
+            {
+                MappingMode = BrushMappingMode.RelativeToBoundingBox,
+                GradientOrigin = new Point(0.5, 0.5),
+                Center = new Point(0.5, 0.5)
+            };
+            ringBrush.GradientStops.Add(new GradientStop(Color.FromArgb(0, 80, 160, 255), 0.0));
+            ringBrush.GradientStops.Add(new GradientStop(Color.FromArgb(0, 80, 160, 255), 0.62));
+            ringBrush.GradientStops.Add(new GradientStop(Color.FromArgb(40, 130, 215, 255), 0.80));
+            ringBrush.GradientStops.Add(new GradientStop(Color.FromArgb(80, 190, 240, 255), 0.88));
+            ringBrush.GradientStops.Add(new GradientStop(Color.FromArgb(0, 80, 160, 255), 1.0));
+            waveScale = new ScaleTransform(0.12, 0.12);
+            waveRing = new Ellipse
+            {
+                Width = ringSize,
+                Height = ringSize,
+                Fill = ringBrush,
+                Opacity = 0,
+                IsHitTestVisible = false,
+                RenderTransformOrigin = new Point(0.5, 0.5),
+                RenderTransform = waveScale
+            };
+            Canvas.SetLeft(waveRing, center.X - ringSize / 2.0);
+            Canvas.SetTop(waveRing, center.Y - ringSize / 2.0);
+            Children.Add(waveRing);
+
+            foreach (TraceSpec spec in traceSpecs)
+            {
+                CreatePulse(spec, rnd);
+            }
+
+            GeometryGroup allGeom = new GeometryGroup();
+            foreach (TraceSpec spec in traceSpecs)
+            {
+                allGeom.Children.Add(spec.Geometry);
+            }
+            breathGlow = new System.Windows.Shapes.Path
+            {
+                Data = allGeom,
+                Stroke = new SolidColorBrush(Color.FromArgb(170, 60, 190, 255)),
+                StrokeThickness = 5.0,
+                StrokeStartLineCap = PenLineCap.Round,
+                StrokeEndLineCap = PenLineCap.Round,
+                StrokeLineJoin = PenLineJoin.Round,
+                Effect = new System.Windows.Media.Effects.BlurEffect { Radius = 8 },
+                Opacity = 0,
+                IsHitTestVisible = false
+            };
+            breathCore = new System.Windows.Shapes.Path
+            {
+                Data = allGeom,
+                Stroke = new SolidColorBrush(Color.FromArgb(255, 200, 245, 255)),
+                StrokeThickness = 1.2,
+                StrokeStartLineCap = PenLineCap.Round,
+                StrokeEndLineCap = PenLineCap.Round,
+                StrokeLineJoin = PenLineJoin.Round,
+                Opacity = 0,
+                IsHitTestVisible = false
+            };
+            Children.Add(breathGlow);
+            Children.Add(breathCore);
+
+            for (int i = 0; i < vias.Count; i++)
+            {
+                Point p = vias[i];
+                Color c = viaAccent[i] ? Color.FromRgb(130, 200, 245) : Color.FromRgb(120, 145, 205);
+                Ellipse ring = new Ellipse
+                {
+                    Width = 4.4,
+                    Height = 4.4,
+                    Stroke = new SolidColorBrush(Color.FromArgb(115, c.R, c.G, c.B)),
+                    StrokeThickness = 0.9,
+                    Fill = new SolidColorBrush(Color.FromArgb(36, c.R, c.G, c.B)),
+                    IsHitTestVisible = false
+                };
+                Canvas.SetLeft(ring, p.X - 2.2);
+                Canvas.SetTop(ring, p.Y - 2.2);
+                Children.Add(ring);
+            }
+        }
+
+        public void PlayPulse()
+        {
+            if (pulseSpecs.Count == 0) return;
+
+            double lastArrival = 0;
+            foreach (PulseSpec spec in pulseSpecs)
+            {
+                double duration = 600 + spec.Length * 1.6;
+                double delay = spec.DelayMs;
+                double arrival = delay + duration;
+                if (arrival > lastArrival) lastArrival = arrival;
+                double coreEnd = -(spec.Length / PulseCoreThickness + PulseDashPx / PulseCoreThickness);
+                double glowEnd = -(spec.Length / PulseGlowThickness + PulseDashPx / PulseGlowThickness);
+
+                spec.Core.BeginAnimation(System.Windows.Shapes.Shape.StrokeDashOffsetProperty, null);
+                spec.Glow.BeginAnimation(System.Windows.Shapes.Shape.StrokeDashOffsetProperty, null);
+                spec.Core.StrokeDashOffset = 0;
+                spec.Glow.StrokeDashOffset = 0;
+
+                spec.Core.BeginAnimation(
+                    System.Windows.Shapes.Shape.StrokeDashOffsetProperty,
+                    new DoubleAnimation(0, coreEnd, TimeSpan.FromMilliseconds(duration))
+                    {
+                        BeginTime = TimeSpan.FromMilliseconds(delay)
+                    });
+                spec.Glow.BeginAnimation(
+                    System.Windows.Shapes.Shape.StrokeDashOffsetProperty,
+                    new DoubleAnimation(0, glowEnd, TimeSpan.FromMilliseconds(duration))
+                    {
+                        BeginTime = TimeSpan.FromMilliseconds(delay)
+                    });
+            }
+
+            double breathStart = Math.Max(150.0, lastArrival - 350.0);
+            AnimateBreath(breathStart, Math.Max(breathStart + 250.0, lastArrival));
+            if (waveRing != null && waveScale != null)
+            {
+                waveScale.BeginAnimation(ScaleTransform.ScaleXProperty, null);
+                waveScale.BeginAnimation(ScaleTransform.ScaleYProperty, null);
+                waveScale.ScaleX = 0.12;
+                waveScale.ScaleY = 0.12;
+                waveRing.BeginAnimation(UIElement.OpacityProperty, null);
+                waveRing.Opacity = 0.18;
+
+                CubicEase growEase = new CubicEase { EasingMode = EasingMode.EaseOut };
+                waveScale.BeginAnimation(ScaleTransform.ScaleXProperty,
+                    new DoubleAnimation(0.12, 1.15, TimeSpan.FromMilliseconds(1800)) { EasingFunction = growEase });
+                waveScale.BeginAnimation(ScaleTransform.ScaleYProperty,
+                    new DoubleAnimation(0.12, 1.15, TimeSpan.FromMilliseconds(1800)) { EasingFunction = growEase });
+                waveRing.BeginAnimation(UIElement.OpacityProperty,
+                    new DoubleAnimation(0.18, 0, TimeSpan.FromMilliseconds(1800))
+                    {
+                        EasingFunction = new CubicEase { EasingMode = EasingMode.EaseIn }
+                    });
+            }
+        }
+
+        private void AnimateBreath(double startMs, double peakMs)
+        {
+            if (breathCore == null || breathGlow == null) return;
+
+            breathCore.BeginAnimation(UIElement.OpacityProperty, null);
+            breathGlow.BeginAnimation(UIElement.OpacityProperty, null);
+            breathCore.Opacity = 0;
+            breathGlow.Opacity = 0;
+            breathCore.BeginAnimation(UIElement.OpacityProperty, BreathKeys(1.0, startMs, peakMs));
+            breathGlow.BeginAnimation(UIElement.OpacityProperty, BreathKeys(0.85, startMs, peakMs));
+        }
+
+        private static DoubleAnimationUsingKeyFrames BreathKeys(double peak, double startMs, double peakMs)
+        {
+            double holdMs = peakMs + 200.0;
+            double endMs = holdMs + 650.0;
+            DoubleAnimationUsingKeyFrames animation = new DoubleAnimationUsingKeyFrames();
+            animation.KeyFrames.Add(new LinearDoubleKeyFrame(0.0, KeyTime.FromTimeSpan(TimeSpan.Zero)));
+            animation.KeyFrames.Add(new LinearDoubleKeyFrame(0.0, KeyTime.FromTimeSpan(TimeSpan.FromMilliseconds(startMs))));
+            animation.KeyFrames.Add(new EasingDoubleKeyFrame(peak, KeyTime.FromTimeSpan(TimeSpan.FromMilliseconds(peakMs)))
+            {
+                EasingFunction = new SineEase { EasingMode = EasingMode.EaseIn }
+            });
+            animation.KeyFrames.Add(new LinearDoubleKeyFrame(peak, KeyTime.FromTimeSpan(TimeSpan.FromMilliseconds(holdMs))));
+            animation.KeyFrames.Add(new EasingDoubleKeyFrame(0.0, KeyTime.FromTimeSpan(TimeSpan.FromMilliseconds(endMs)))
+            {
+                EasingFunction = new SineEase { EasingMode = EasingMode.EaseOut }
+            });
+            return animation;
+        }
+
+        private void CreatePulse(TraceSpec spec, Random rnd)
+        {
+            double coreUnits = PulseDashPx / PulseCoreThickness;
+            double glowUnits = PulseDashPx / PulseGlowThickness;
+            double coreEnd = -(spec.Length / PulseCoreThickness + coreUnits);
+            double glowEnd = -(spec.Length / PulseGlowThickness + glowUnits);
+
+            System.Windows.Shapes.Path glow = new System.Windows.Shapes.Path
+            {
+                Data = spec.Geometry,
+                Stroke = new SolidColorBrush(Color.FromArgb(130, 120, 205, 255)),
+                StrokeThickness = PulseGlowThickness,
+                StrokeDashArray = new DoubleCollection { glowUnits, 1000.0 },
+                StrokeDashOffset = glowEnd,
+                StrokeStartLineCap = PenLineCap.Round,
+                StrokeEndLineCap = PenLineCap.Round,
+                StrokeDashCap = PenLineCap.Round,
+                IsHitTestVisible = false
+            };
+            System.Windows.Shapes.Path core = new System.Windows.Shapes.Path
+            {
+                Data = spec.Geometry,
+                Stroke = new SolidColorBrush(Color.FromArgb(255, 235, 250, 255)),
+                StrokeThickness = PulseCoreThickness,
+                StrokeDashArray = new DoubleCollection { coreUnits, 1000.0 },
+                StrokeDashOffset = coreEnd,
+                StrokeStartLineCap = PenLineCap.Round,
+                StrokeEndLineCap = PenLineCap.Round,
+                StrokeDashCap = PenLineCap.Round,
+                IsHitTestVisible = false
+            };
+            Children.Add(glow);
+            Children.Add(core);
+            pulseSpecs.Add(new PulseSpec
+            {
+                Core = core,
+                Glow = glow,
+                Length = spec.Length,
+                DelayMs = rnd.Next(0, 150)
+            });
+        }
+
+        private static double[] SortedPositions(double min, double max, int count, Random rnd)
+        {
+            double slot = (max - min) / count;
+            double[] result = new double[count];
+            for (int i = 0; i < count; i++)
+            {
+                result[i] = min + slot * (i + 0.15 + rnd.NextDouble() * 0.7);
+            }
+            return result;
+        }
+
+        private static void AddTopTrace(PathFigure figure, Point start, double endX, double endY, Random rnd, out Point viaPoint)
+        {
+            Point current = start;
+            double dx = endX - start.X;
+            double sign = dx >= 0 ? 1.0 : -1.0;
+            double totalY = Math.Abs(endY - start.Y);
+            double v1 = totalY * (0.15 + rnd.NextDouble() * 0.25);
+            AddSegment(figure, ref current, 0, -v1);
+
+            double diag = Math.Min(Math.Abs(dx) * (0.25 + rnd.NextDouble() * 0.35), Math.Abs(endY - current.Y) * 0.45);
+            if (diag > 3)
+            {
+                AddSegment(figure, ref current, sign * diag, -diag);
+                dx -= sign * diag;
+            }
+
+            double v2 = (endY - current.Y) * (0.25 + rnd.NextDouble() * 0.3);
+            AddSegment(figure, ref current, 0, v2);
+
+            if (Math.Abs(dx) > 3)
+            {
+                double h = dx * (0.35 + rnd.NextDouble() * 0.35);
+                AddSegment(figure, ref current, h, 0);
+                dx -= h;
+            }
+
+            viaPoint = current;
+            AddSegment(figure, ref current, 0, endY - current.Y);
+        }
+
+        private static void AddBottomTrace(PathFigure figure, Point start, double endX, double endY, Random rnd, out Point viaPoint)
+        {
+            Point current = start;
+            double dx = endX - start.X;
+            double sign = dx >= 0 ? 1.0 : -1.0;
+            double totalY = Math.Abs(endY - start.Y);
+            double v1 = totalY * (0.15 + rnd.NextDouble() * 0.25);
+            AddSegment(figure, ref current, 0, v1);
+
+            double diag = Math.Min(Math.Abs(dx) * (0.25 + rnd.NextDouble() * 0.35), Math.Abs(endY - current.Y) * 0.45);
+            if (diag > 3)
+            {
+                AddSegment(figure, ref current, sign * diag, diag);
+                dx -= sign * diag;
+            }
+
+            double v2 = (endY - current.Y) * (0.25 + rnd.NextDouble() * 0.3);
+            AddSegment(figure, ref current, 0, v2);
+
+            if (Math.Abs(dx) > 3)
+            {
+                double h = dx * (0.35 + rnd.NextDouble() * 0.35);
+                AddSegment(figure, ref current, h, 0);
+                dx -= h;
+            }
+
+            viaPoint = current;
+            AddSegment(figure, ref current, 0, endY - current.Y);
+        }
+
+        private static void AddLeftTrace(PathFigure figure, Point start, double endX, double endY, Random rnd, out Point viaPoint)
+        {
+            Point current = start;
+            double dy = endY - start.Y;
+            double sign = dy >= 0 ? 1.0 : -1.0;
+            double totalX = Math.Abs(endX - start.X);
+            double h1 = totalX * (0.15 + rnd.NextDouble() * 0.25);
+            AddSegment(figure, ref current, -h1, 0);
+
+            double diag = Math.Min(Math.Abs(dy) * (0.25 + rnd.NextDouble() * 0.35), Math.Abs(endX - current.X) * 0.45);
+            if (diag > 3)
+            {
+                AddSegment(figure, ref current, -diag, sign * diag);
+                dy -= sign * diag;
+            }
+
+            double h2 = (endX - current.X) * (0.25 + rnd.NextDouble() * 0.3);
+            AddSegment(figure, ref current, h2, 0);
+
+            if (Math.Abs(dy) > 3)
+            {
+                double v = dy * (0.35 + rnd.NextDouble() * 0.35);
+                AddSegment(figure, ref current, 0, v);
+                dy -= v;
+            }
+
+            viaPoint = current;
+            AddSegment(figure, ref current, endX - current.X, 0);
+        }
+
+        private static void AddRightTrace(PathFigure figure, Point start, double endX, double endY, Random rnd, out Point viaPoint)
+        {
+            Point current = start;
+            double dy = endY - start.Y;
+            double sign = dy >= 0 ? 1.0 : -1.0;
+            double totalX = endX - start.X;
+            double h1 = totalX * (0.15 + rnd.NextDouble() * 0.25);
+            AddSegment(figure, ref current, h1, 0);
+
+            double diag = Math.Min(Math.Abs(dy) * (0.25 + rnd.NextDouble() * 0.35), Math.Abs(endX - current.X) * 0.45);
+            if (diag > 3)
+            {
+                AddSegment(figure, ref current, diag, sign * diag);
+                dy -= sign * diag;
+            }
+
+            double h2 = (endX - current.X) * (0.25 + rnd.NextDouble() * 0.3);
+            AddSegment(figure, ref current, h2, 0);
+
+            if (Math.Abs(dy) > 3)
+            {
+                double v = dy * (0.35 + rnd.NextDouble() * 0.35);
+                AddSegment(figure, ref current, 0, v);
+                dy -= v;
+            }
+
+            viaPoint = current;
+            AddSegment(figure, ref current, endX - current.X, 0);
+        }
+
+        private static Point RayRect(Point center, double angle, double halfW, double halfH)
+        {
+            double dx = Math.Cos(angle);
+            double dy = Math.Sin(angle);
+            double tx = Math.Abs(dx) < 1e-6 ? double.MaxValue : halfW / Math.Abs(dx);
+            double ty = Math.Abs(dy) < 1e-6 ? double.MaxValue : halfH / Math.Abs(dy);
+            double t = Math.Min(tx, ty);
+            return new Point(center.X + dx * t, center.Y + dy * t);
+        }
+
+        private static Point RayWindow(Point center, double angle, double width, double height, double overshoot)
+        {
+            double dx = Math.Cos(angle);
+            double dy = Math.Sin(angle);
+            double t = double.MaxValue;
+            if (dx > 1e-6) t = Math.Min(t, (width + overshoot - center.X) / dx);
+            else if (dx < -1e-6) t = Math.Min(t, (-overshoot - center.X) / dx);
+            if (dy > 1e-6) t = Math.Min(t, (height + overshoot - center.Y) / dy);
+            else if (dy < -1e-6) t = Math.Min(t, (-overshoot - center.Y) / dy);
+            return new Point(center.X + dx * t, center.Y + dy * t);
+        }
+
+        private static void AddRadialTrace(PathFigure figure, Point start, Point end, Random rnd, out Point viaPoint)
+        {
+            Point current = start;
+            double dx = end.X - start.X;
+            double dy = end.Y - start.Y;
+            double length = Math.Sqrt(dx * dx + dy * dy);
+            if (length < 2)
+            {
+                AddSegment(figure, ref current, dx, dy);
+                viaPoint = current;
+                return;
+            }
+
+            double ux = dx / length;
+            double uy = dy / length;
+            double px = -uy;
+            double py = ux;
+            double offset1 = (rnd.NextDouble() * 2.0 - 1.0) * 3.2;
+            double offset2 = (rnd.NextDouble() * 2.0 - 1.0) * 3.2;
+            double f1 = 0.30 + rnd.NextDouble() * 0.12;
+            double f2 = 0.62 + rnd.NextDouble() * 0.12;
+
+            Point p1 = new Point(
+                start.X + ux * length * f1 + px * offset1,
+                start.Y + uy * length * f1 + py * offset1);
+            Point p2 = new Point(
+                start.X + ux * length * f2 + px * offset2,
+                start.Y + uy * length * f2 + py * offset2);
+
+            AddSegment(figure, ref current, p1.X - current.X, p1.Y - current.Y);
+            AddSegment(figure, ref current, p2.X - current.X, p2.Y - current.Y);
+            viaPoint = current;
+            AddSegment(figure, ref current, end.X - current.X, end.Y - current.Y);
+        }
+
+        private static double GetFigureLength(PathFigure figure)
+        {
+            double length = 0;
+            Point previous = figure.StartPoint;
+            foreach (PathSegment segment in figure.Segments)
+            {
+                LineSegment line = segment as LineSegment;
+                if (line == null) continue;
+                double dx = line.Point.X - previous.X;
+                double dy = line.Point.Y - previous.Y;
+                length += Math.Sqrt(dx * dx + dy * dy);
+                previous = line.Point;
+            }
+            return length;
+        }
+
+        private static void AddSegment(PathFigure figure, ref Point current, double dx, double dy)
+        {
+            Point next = new Point(current.X + dx, current.Y + dy);
+            figure.Segments.Add(new LineSegment(next, true));
+            current = next;
+        }
+
+        private void AddLine(GeometryGroup geometry, Color color, double thickness)
+        {
+            System.Windows.Shapes.Path path = new System.Windows.Shapes.Path
+            {
+                Data = geometry,
+                Stroke = new SolidColorBrush(color),
+                StrokeThickness = thickness,
+                StrokeStartLineCap = PenLineCap.Round,
+                StrokeEndLineCap = PenLineCap.Round,
+                StrokeLineJoin = PenLineJoin.Round,
+                IsHitTestVisible = false
+            };
+            Children.Add(path);
         }
     }
 
