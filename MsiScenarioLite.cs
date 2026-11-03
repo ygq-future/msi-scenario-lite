@@ -1098,6 +1098,25 @@ namespace MsiScenarioLite
                 };
                 Grid.SetRowSpan(bgChip, 2);
                 rootGrid.Children.Add(bgChip);
+
+                // Mirror the same circuit motif on the left edge so the empty left half of the
+                // header/content band gets the same subtle tech texture as the right side.
+                // Horizontal flip keeps the two sides from reading as one repeated rectangle.
+                Image bgChipLeft = new Image
+                {
+                    Source = chipBmp,
+                    Width = 288,
+                    Height = 288,
+                    HorizontalAlignment = HorizontalAlignment.Left,
+                    VerticalAlignment = VerticalAlignment.Top,
+                    Margin = new Thickness(-24, 4, 0, 0),
+                    Opacity = 0.26,
+                    IsHitTestVisible = false,
+                    RenderTransformOrigin = new Point(0.5, 0.5),
+                    RenderTransform = new ScaleTransform(-1, 1)
+                };
+                Grid.SetRowSpan(bgChipLeft, 2);
+                rootGrid.Children.Add(bgChipLeft);
             }
 
             // ================= 1. TOP BAR =================
@@ -1119,7 +1138,7 @@ namespace MsiScenarioLite
             {
                 Orientation = Orientation.Horizontal,
                 VerticalAlignment = VerticalAlignment.Center,
-                Margin = new Thickness(24, 0, 0, 0)
+                Margin = new Thickness(14, 0, 0, 0)
             };
 
             brandPanel.Children.Add(CreateCrispVectorLogoBadge());
@@ -1197,7 +1216,7 @@ namespace MsiScenarioLite
             // ================= 2. MAIN CONTENT (Exact 12px top, 12px middle, 12px bottom symmetry!) =================
             Grid contentGrid = new Grid
             {
-                Margin = new Thickness(24, 12, 24, 12)
+                Margin = new Thickness(14, 12, 14, 12)
             };
             contentGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); // Heading "场景设置" + Cooler Boost
             contentGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); // 3 Full-Width Scenario Cards
@@ -1609,7 +1628,7 @@ namespace MsiScenarioLite
                 Background = new SolidColorBrush(Color.FromArgb(170, 10, 12, 22)),
                 BorderBrush = new SolidColorBrush(Color.FromRgb(30, 36, 62)),
                 BorderThickness = new Thickness(0, 1, 0, 0),
-                Padding = new Thickness(24, 0, 24, 0)
+                Padding = new Thickness(14, 0, 14, 0)
             };
             Grid statusGrid = new Grid();
             txtEcStatus = new TextBlock
