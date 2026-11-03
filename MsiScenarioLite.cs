@@ -546,10 +546,19 @@ namespace MsiScenarioLite
         [DllImport("user32.dll", EntryPoint = "SetClassLongW")]
         private static extern uint SetClassLong32(IntPtr hWnd, int nIndex, uint dwNewLong);
 
+        [DllImport("dwmapi.dll")]
+        private static extern int DwmSetWindowAttribute(IntPtr hwnd, int dwmAttribute, ref int pvAttribute, int cbAttribute);
+
         private const uint WM_SETICON = 0x0080;
         private const int GWL_STYLE = -16;
         private const int WS_MINIMIZEBOX = 0x00020000;
         private const int WS_SYSMENU = 0x00080000;
+        // WS_CAPTION (WS_BORDER | WS_DLGFRAME) is added purely so Windows/DWM classify the
+        // window as a normal framed top-level window. Without any frame bits DWM treats a
+        // caption-less window like a popup and skips the native minimize/restore transition.
+        // WM_NCCALCSIZE keeps the whole window as client area, so nothing is actually drawn.
+        private const int WS_CAPTION = 0x00C00000;
+        private const int WM_NCCALCSIZE = 0x0083;
         private const int SM_CXICON = 11;
         private const int SM_CYICON = 12;
         private const int SM_CXSMICON = 49;
@@ -557,8 +566,16 @@ namespace MsiScenarioLite
         private const int GCLP_HICON = -14;
         private const int GCLP_HICONSM = -34;
 
+        // DWMWA_WINDOW_CORNER_PREFERENCE / DWMWCP_ROUND are Windows 11 22H2+ APIs.
+        // DwmSetWindowAttribute returns a failure HRESULT on older builds, where the window
+        // simply keeps square corners.
+        private const int DWMWA_WINDOW_CORNER_PREFERENCE = 33;
+        private const int DWMWCP_ROUND = 2;
+
         private Drawing.Icon winBigIcon;
         private Drawing.Icon winSmallIcon;
+        private HwndSource hwndSource;
+        private bool nccalcSizeHooked;
 
         private Border cardGaming;
         private Border cardBalanced;
@@ -629,8 +646,12 @@ namespace MsiScenarioLite
             ResizeMode = ResizeMode.CanMinimize;
             WindowStartupLocation = WindowStartupLocation.CenterScreen;
             WindowStyle = WindowStyle.None;
-            AllowsTransparency = true;
-            Background = Brushes.Transparent;
+
+            // AllowsTransparency MUST stay false: WPF implements it with WS_EX_LAYERED, and DWM
+            // skips the native minimize/restore (genie) transition for layered windows. We keep
+            // the rounded look instead through DWM corner preference on the opaque window.
+            AllowsTransparency = false;
+            Background = new SolidColorBrush(Color.FromRgb(11, 13, 24));
 
             string icoPath = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Assets", "app.ico");
 
@@ -647,6 +668,10 @@ namespace MsiScenarioLite
                 }
             };
             Loaded += (s, e) => ApplyNativeWindowStyleAndIcons(icoPath);
+            StateChanged += (s, e) =>
+            {
+                if (WindowState == WindowState.Normal) ApplyNativeWindowStyleAndIcons(icoPath);
+            };
 
             autoRestoreScenarioEnabled = EcHardwareController.LoadAutoRestoreScenarioEnabled();
             lastStartupState = EcHardwareController.ReadWindowsStartupState();
@@ -684,6 +709,19 @@ namespace MsiScenarioLite
             }
         }
 
+        // Returning 0 for WM_NCCALCSIZE with a non-zero wParam leaves rgrc[0] (the window rect)
+        // untouched, so the client area becomes the entire window. The WS_CAPTION style bit we
+        // add stays on for classification purposes only and is never rendered.
+        private IntPtr NccalcSizeHook(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
+        {
+            if (msg == WM_NCCALCSIZE && wParam != IntPtr.Zero)
+            {
+                handled = true;
+                return IntPtr.Zero;
+            }
+            return IntPtr.Zero;
+        }
+
         private void ApplyNativeWindowStyleAndIcons(string icoPath)
         {
             try
@@ -693,8 +731,32 @@ namespace MsiScenarioLite
 
                 // Ensure WS_MINIMIZEBOX | WS_SYSMENU on the borderless window so clicking the
                 // Windows taskbar icon toggles between Normal and Minimized natively.
+                // WS_CAPTION restores the "normal top-level window" classification that the
+                // DWM minimize/restore transition requires; WM_NCCALCSIZE below keeps the
+                // entire window as client area so no caption or frame is ever visible.
                 int style = GetWindowLong(hwnd, GWL_STYLE);
-                SetWindowLong(hwnd, GWL_STYLE, style | WS_MINIMIZEBOX | WS_SYSMENU);
+                int desiredStyle = style | WS_MINIMIZEBOX | WS_SYSMENU | WS_CAPTION;
+                if (desiredStyle != style)
+                {
+                    SetWindowLong(hwnd, GWL_STYLE, desiredStyle);
+                }
+
+                if (!nccalcSizeHooked)
+                {
+                    hwndSource = HwndSource.FromHwnd(hwnd);
+                    if (hwndSource != null)
+                    {
+                        hwndSource.AddHook(NccalcSizeHook);
+                        nccalcSizeHooked = true;
+                    }
+                }
+
+                // DWM owns the window shape now: the client area is square and fills the whole
+                // window, so DWM's single rounded clip (and its shadow) is the only corner
+                // geometry in play. Border colour is left at the system default so the outline
+                // follows that same arc.
+                int cornerPreference = DWMWCP_ROUND;
+                DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, ref cornerPreference, sizeof(int));
 
                 int bigW = GetSystemMetrics(SM_CXICON);
                 int bigH = GetSystemMetrics(SM_CYICON);
@@ -995,8 +1057,11 @@ namespace MsiScenarioLite
         {
             Border outerBorder = new Border
             {
-                CornerRadius = new CornerRadius(12),
-                BorderThickness = new Thickness(1),
+                // The window itself is rounded and outlined by DWM, so the content fills the
+                // whole client area with square corners. Drawing a second, differently sized
+                // rounded shape here produced crescents / right-angle shadows at the corners.
+                CornerRadius = new CornerRadius(0),
+                BorderThickness = new Thickness(0),
                 BorderBrush = new SolidColorBrush(Color.FromRgb(42, 48, 78)),
                 SnapsToDevicePixels = true,
                 UseLayoutRounding = true,
@@ -1010,7 +1075,7 @@ namespace MsiScenarioLite
             Grid rootGrid = new Grid();
             rootGrid.SizeChanged += (s, e) =>
             {
-                rootGrid.Clip = new RectangleGeometry(new Rect(0, 0, e.NewSize.Width, e.NewSize.Height), 11, 11);
+                rootGrid.Clip = new RectangleGeometry(new Rect(0, 0, e.NewSize.Width, e.NewSize.Height), 0, 0);
             };
 
             rootGrid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(46) }); // Top Bar
@@ -1038,7 +1103,7 @@ namespace MsiScenarioLite
             // ================= 1. TOP BAR =================
             Border topBarBorder = new Border
             {
-                CornerRadius = new CornerRadius(11, 11, 0, 0),
+                CornerRadius = new CornerRadius(0),
                 Background = new SolidColorBrush(Color.FromArgb(130, 14, 17, 30)),
                 BorderBrush = new SolidColorBrush(Color.FromRgb(28, 34, 58)),
                 BorderThickness = new Thickness(0, 0, 0, 1)
@@ -1540,7 +1605,7 @@ namespace MsiScenarioLite
             // ================= 4. FOOTER STATUS BAR =================
             Border statusBar = new Border
             {
-                CornerRadius = new CornerRadius(0, 0, 11, 11),
+                CornerRadius = new CornerRadius(0),
                 Background = new SolidColorBrush(Color.FromArgb(170, 10, 12, 22)),
                 BorderBrush = new SolidColorBrush(Color.FromRgb(30, 36, 62)),
                 BorderThickness = new Thickness(0, 1, 0, 0),
