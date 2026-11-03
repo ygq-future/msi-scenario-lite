@@ -1,0 +1,11 @@
+@echo off
+setlocal
+:: This file is intentionally ASCII-only.
+:: cmd.exe parses batch files with the console OEM code page, so non-ASCII text
+:: in a .bat turns into garbage commands on non-matching locales. All Chinese
+:: messages are printed by the PowerShell script instead.
+::
+:: Double-click menu for the WHEA hardware-error alert task.
+
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0WHEA-Alert.ps1" -Menu
+if errorlevel 1 pause

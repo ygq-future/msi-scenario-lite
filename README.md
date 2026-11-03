@@ -45,6 +45,7 @@ MSI Center 做三件很小的事，却要付出很大代价：
 | :--- | :--- |
 | 系统 | Windows 10 / 11 x64 |
 | 运行时 | .NET Framework 4.7.2 或更高 —— **Windows 10 1903+ / Windows 11 已内置（4.8 / 4.8.1），无需下载** |
+| 依赖 | 本机已安装 **MSI Center**（仅用于提取 `MSIWMIACPI2.dll`；安装好后可按下方说明停用它的后台服务） |
 | 编译器 | 同上：`%WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe` 随系统自带，**不需要 Visual Studio、.NET SDK 或任何额外安装** |
 | 硬件 | 支持 MSI `WMIACPI 2.8` 的微星笔记本（本项目在 MSI Alpha 17 C7VF 上实测；其他机型需自行验证寄存器语义） |
 | 权限 | **管理员**（已内嵌 `requireAdministrator` 清单，双击即提权） |
@@ -55,19 +56,37 @@ MSI Center 做三件很小的事，却要付出很大代价：
 
 ---
 
-## 构建
+## 快速开始
 
-仓库**不包含**微星专有二进制文件（`MSIWMIACPI2.dll`）。它由脚本从**你本地已安装**的 MSI Center 中复制，不随仓库分发。
+1. 确认本机已安装 **MSI Center**（只需要它目录里的 `MSIWMIACPI2.dll`）。
+2. 解压发布包（或 `git clone` 仓库）。
+3. 双击根目录的 **`Start.bat`**，在 UAC 弹窗中选择“是”。
+
+> 如果 Windows 弹出“Windows 已保护你的电脑”等安全提示，点“更多信息 → 仍要运行”即可。
+
+`Start.bat` 会把所有准备工作一次做完，全程不需要命令行：
+
+| 步骤 | 自动执行的内容 |
+| :--- | :--- |
+| 1 | 清理旧版本遗留的无关文件（`ResetUEFIVariable.exe`、`UEFIVaribleDll.dll`） |
+| 2 | 从本机 MSI Center 复制唯一依赖 `MSIWMIACPI2.dll`（已存在则跳过） |
+| 3 | 用系统自带 `csc.exe` 编译（`MsiScenarioLite.exe` 不存在或源码有改动时） |
+| 4 | 启动程序；若程序已在托盘运行，则直接切回前台 |
+
+> 之后日常启动直接双击 `MsiScenarioLite.exe` 即可。运行目录需包含 `Assets\` 与 `MSIWMIACPI2.dll`（即仓库根目录本身）。
+
+### 从旧版本升级
+
+把新包直接解压覆盖到原目录，再双击一次 `Start.bat` 即可。脚本会删除旧版本残留的两个无关依赖文件，并在源码 / 依赖有变化时自动重新编译，不需要手动清理或命令行操作。
+
+### 手动构建（开发者）
 
 ```powershell
-# 1. 从本地 MSI Center 安装目录复制所需依赖（不下载任何东西）
 powershell -ExecutionPolicy Bypass -File .\tools\Prepare-Dependencies.ps1
-
-# 2. 编译（调用系统自带 csc.exe，无需安装 Visual Studio / SDK）
 powershell -ExecutionPolicy Bypass -File .\build.ps1
 ```
 
-产物：仓库根目录的 `MsiScenarioLite.exe`。运行目录需包含 `Assets\` 与 `MSIWMIACPI2.dll`（即仓库根目录本身）。
+`build.ps1` 需要的唯一第三方文件是 `MSIWMIACPI2.dll`；`Prepare-Dependencies.ps1` 会从本机 MSI Center 自动查找并复制它（不下载任何内容），同时清理旧版残留。
 
 ### 编码约定（改脚本前必读）
 
@@ -83,7 +102,7 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 
 ## 使用
 
-1. 以管理员身份运行 `MsiScenarioLite.exe`。
+1. 首次使用双击 `Start.bat`，之后直接双击 `MsiScenarioLite.exe`；两者都会触发 UAC 提权。
 2. 点击三张卡片之一即可切换场景；右上角可单独开关强冷。
 3. 底部红蓝条切换显卡模式 —— 只写标记，**下次正常重启时生效**。
 4. 点右上角 `✕` 隐藏到托盘；托盘右键 → 「完全退出程序」才是真正退出。
@@ -103,20 +122,17 @@ tools\Restore-MSICenter.bat   # 需要时一键恢复
 
 | 脚本 | 用途 |
 | :--- | :--- |
-| `Prepare-Dependencies.ps1` | 从本地 MSI Center 复制 `MSIWMIACPI2.dll` |
+| `Start.bat`（仓库根目录） | **一键启动**：准备依赖 → 按需编译 → 运行（普通用户只需双击这个） |
+| `Bootstrap.ps1` | `Start.bat` 的启动逻辑：自动提权、清理旧文件、按内容哈希判断是否需要重编译 |
+| `Prepare-Dependencies.ps1` | 自动查找 MSI Center 并复制 `MSIWMIACPI2.dll`，同时清理旧版残留 |
+| `WHEA-Alert.bat` | **双击打开菜单**：安装 / 测试 / 查看状态 / 卸载 WHEA 硬件错误告警 |
+| `MSICenter-Startup.bat` | **双击打开菜单**：查看 / 禁用 / 恢复 MSI Center 的 UWP 启动项 |
 | `Disable-MSICenter.bat` | 一键禁用原版后台服务、UWP 启动项与开机任务（自动提权） |
 | `Restore-MSICenter.bat` | 一键恢复原版后台服务、UWP 启动项与开机任务（自动提权） |
-| `MSICenter-Startup.ps1` | 单独控制「设置 → 应用 → 启动」里的 MSI Center 项（`-Disable` / `-Enable` / `-Status`） |
-| `WHEA-Alert.ps1` | WHEA 硬件错误实时弹窗告警：`-Install` 一键安装计划任务，`-Uninstall` 卸载，`-Test` 测试弹窗 |
+| `MSICenter-Startup.ps1` | 底层脚本（`-Menu` / `-Disable` / `-Enable` / `-Status`） |
+| `WHEA-Alert.ps1` | 底层脚本（`-Menu` / `-Install` / `-Uninstall` / `-Test`） |
 
-```powershell
-# 安装 WHEA 实时告警（注册事件触发的计划任务，平时 0 内存占用）
-powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\WHEA-Alert.ps1 -Install
-
-# 测试弹窗 / 卸载
-powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\WHEA-Alert.ps1 -Test
-powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\WHEA-Alert.ps1 -Uninstall
-```
+WHEA 告警不再需要命令行：**双击 `tools\WHEA-Alert.bat`** 即可打开菜单，安装后的计划任务平时不占内存。
 
 ---
 

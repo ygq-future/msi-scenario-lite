@@ -2,13 +2,12 @@
 *.exe
 *.pdb
 *.obj
+.build-stamp
 bin/
 obj/
 
-# MSI proprietary binaries (copied locally by tools/Prepare-Dependencies.ps1)
+# MSI proprietary binary (copied locally by tools/Prepare-Dependencies.ps1)
 MSIWMIACPI2.dll
-ResetUEFIVariable.exe
-UEFIVaribleDll.dll
 
 # Local/editor noise
 .vs/
