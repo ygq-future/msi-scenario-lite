@@ -152,6 +152,111 @@ namespace MsiScenarioLite
             catch { }
         }
 
+        // ---- Windows Startup Apps bidirectional integration -----------------------
+        // Synchronizes directly with Windows Settings -> Apps -> Startup:
+        //   1. HKCU\Software\Microsoft\Windows\CurrentVersion\Run ("MSI Scenario Lite")
+        //   2. HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run
+        //      Byte[0]: even (0x02 / 0x06) = Enabled; odd (0x01 / 0x03) = Disabled in Windows Settings.
+
+        private const string StartupValueName = "MSI Scenario Lite";
+        private const string RunKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
+        private const string StartupApprovedRunKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
+
+        public enum StartupRegistrationState
+        {
+            NotRegistered,
+            Enabled,
+            DisabledByWindowsSettings
+        }
+
+        public static StartupRegistrationState ReadWindowsStartupState()
+        {
+            try
+            {
+                using (RegistryKey runKey = Registry.CurrentUser.OpenSubKey(RunKeyPath, false))
+                {
+                    if (runKey == null) return StartupRegistrationState.NotRegistered;
+                    string runVal = runKey.GetValue(StartupValueName) as string;
+                    if (string.IsNullOrEmpty(runVal)) return StartupRegistrationState.NotRegistered;
+                }
+
+                using (RegistryKey appKey = Registry.CurrentUser.OpenSubKey(StartupApprovedRunKeyPath, false))
+                {
+                    if (appKey != null)
+                    {
+                        byte[] raw = appKey.GetValue(StartupValueName) as byte[];
+                        if (raw != null && raw.Length >= 1)
+                        {
+                            // In Windows StartupApproved\Run, bit 0 == 1 (0x01, 0x03, ...) means disabled by user/policy
+                            if ((raw[0] & 0x01) != 0)
+                            {
+                                return StartupRegistrationState.DisabledByWindowsSettings;
+                            }
+                        }
+                    }
+                }
+
+                return StartupRegistrationState.Enabled;
+            }
+            catch
+            {
+                return StartupRegistrationState.NotRegistered;
+            }
+        }
+
+        public static bool SetWindowsStartupEnabled(bool enable, out string error)
+        {
+            error = null;
+            try
+            {
+                string exePath = Process.GetCurrentProcess().MainModule.FileName;
+                string commandLine = string.Format("\"{0}\" --minimized", exePath);
+
+                using (RegistryKey runKey = Registry.CurrentUser.CreateSubKey(RunKeyPath))
+                {
+                    if (runKey == null)
+                    {
+                        error = "无法打开 HKCU\\...\\Run 注册表项。";
+                        return false;
+                    }
+                    // Keep the Run entry registered so MSI Scenario Lite stays visible in
+                    // Windows Settings -> Apps -> Startup whether enabled or disabled.
+                    runKey.SetValue(StartupValueName, commandLine, RegistryValueKind.String);
+                }
+
+                using (RegistryKey appKey = Registry.CurrentUser.CreateSubKey(StartupApprovedRunKeyPath))
+                {
+                    if (appKey == null)
+                    {
+                        error = "无法打开 StartupApproved\\Run 注册表项。";
+                        return false;
+                    }
+
+                    byte[] data = new byte[12];
+                    if (enable)
+                    {
+                        // 0x02 + 11 zero bytes = Enabled in Windows Settings
+                        data[0] = 0x02;
+                    }
+                    else
+                    {
+                        // 0x03 + 8-byte FILETIME timestamp = Disabled by user in Windows Settings
+                        data[0] = 0x03;
+                        byte[] ft = BitConverter.GetBytes(DateTime.UtcNow.ToFileTimeUtc());
+                        Buffer.BlockCopy(ft, 0, data, 4, 8);
+                    }
+                    appKey.SetValue(StartupValueName, data, RegistryValueKind.Binary);
+                }
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                return false;
+            }
+        }
+
         public static string SyncMsiCenterRegistryAndNotifyUI(byte modeCode)
         {
             try
@@ -426,6 +531,15 @@ namespace MsiScenarioLite
         [DllImport("user32.dll", CharSet = CharSet.Auto)]
         private static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
 
+        [DllImport("user32.dll")]
+        private static extern int GetSystemMetrics(int nIndex);
+
+        [DllImport("user32.dll", EntryPoint = "GetWindowLongW")]
+        private static extern int GetWindowLong(IntPtr hWnd, int nIndex);
+
+        [DllImport("user32.dll", EntryPoint = "SetWindowLongW")]
+        private static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
+
         [DllImport("user32.dll", EntryPoint = "SetClassLongPtrW")]
         private static extern IntPtr SetClassLongPtr64(IntPtr hWnd, int nIndex, IntPtr dwNewLong);
 
@@ -433,6 +547,13 @@ namespace MsiScenarioLite
         private static extern uint SetClassLong32(IntPtr hWnd, int nIndex, uint dwNewLong);
 
         private const uint WM_SETICON = 0x0080;
+        private const int GWL_STYLE = -16;
+        private const int WS_MINIMIZEBOX = 0x00020000;
+        private const int WS_SYSMENU = 0x00080000;
+        private const int SM_CXICON = 11;
+        private const int SM_CYICON = 12;
+        private const int SM_CXSMICON = 49;
+        private const int SM_CYSMICON = 50;
         private const int GCLP_HICON = -14;
         private const int GCLP_HICONSM = -34;
 
@@ -446,6 +567,11 @@ namespace MsiScenarioLite
         private TextBlock badgeGaming;
         private TextBlock badgeBalanced;
         private TextBlock badgeSilent;
+
+        private Border btnWindowsStartup;
+        private TextBlock txtWindowsStartup;
+        private Ellipse dotWindowsStartup;
+        private EcHardwareController.StartupRegistrationState lastStartupState = EcHardwareController.StartupRegistrationState.NotRegistered;
 
         private Border btnAutoRestoreScenario;
         private TextBlock txtAutoRestoreScenario;
@@ -479,6 +605,7 @@ namespace MsiScenarioLite
         private WinForms.MenuItem menuGaming;
         private WinForms.MenuItem menuBalanced;
         private WinForms.MenuItem menuSilent;
+        private WinForms.MenuItem menuWindowsStartup;
         private WinForms.MenuItem menuAutoRestoreScenario;
         private WinForms.MenuItem menuCoolerBoost;
         private WinForms.MenuItem menuGpuDiscrete;
@@ -491,7 +618,7 @@ namespace MsiScenarioLite
         private bool? stagedIsDiscrete = null;
         private bool? lastAnimatedDiscrete = null;
 
-        public MainWindow()
+        public MainWindow(bool startMinimized)
         {
             try { SetCurrentProcessExplicitAppUserModelID("MsiScenarioLite.PureEcControl.1"); }
             catch { }
@@ -499,31 +626,30 @@ namespace MsiScenarioLite
             Title = "MSI Scenario Lite";
             Width = 780;
             SizeToContent = SizeToContent.Height;
-            ResizeMode = ResizeMode.NoResize;
+            ResizeMode = ResizeMode.CanMinimize;
             WindowStartupLocation = WindowStartupLocation.CenterScreen;
             WindowStyle = WindowStyle.None;
             AllowsTransparency = true;
             Background = Brushes.Transparent;
 
             string icoPath = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Assets", "app.ico");
-            string logoPngPath = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Assets", "logo.png");
-            if (File.Exists(icoPath))
-            {
-                try
-                {
-                    Icon = BitmapFrame.Create(new Uri(icoPath, UriKind.Absolute), BitmapCreateOptions.None, BitmapCacheOption.OnLoad);
-                }
-                catch { }
-            }
-            if (Icon == null && File.Exists(logoPngPath))
-            {
-                try { Icon = LoadAsset("logo.png"); }
-                catch { }
-            }
 
-            SourceInitialized += (s, e) => ApplyNativeWindowIcons(icoPath);
+            // Do NOT set WPF's Window.Icon property: WPF's internal Window.UpdateIcon()
+            // scales the ImageSource down to SM_CXSMICON (20x20 at 125% DPI) and sends that
+            // 20x20 HICON to BOTH WM_SETICON(ICON_SMALL) and WM_SETICON(ICON_BIG), causing
+            // the Windows taskbar to upscale a 20x20 icon! Instead, set native HICONs directly.
+            SourceInitialized += (s, e) =>
+            {
+                ApplyNativeWindowStyleAndIcons(icoPath);
+                if (startMinimized)
+                {
+                    Hide();
+                }
+            };
+            Loaded += (s, e) => ApplyNativeWindowStyleAndIcons(icoPath);
 
             autoRestoreScenarioEnabled = EcHardwareController.LoadAutoRestoreScenarioEnabled();
+            lastStartupState = EcHardwareController.ReadWindowsStartupState();
 
             BuildUI();
             InitSystemTray(icoPath);
@@ -558,26 +684,46 @@ namespace MsiScenarioLite
             }
         }
 
-        private void ApplyNativeWindowIcons(string icoPath)
+        private void ApplyNativeWindowStyleAndIcons(string icoPath)
         {
             try
             {
                 IntPtr hwnd = new WindowInteropHelper(this).Handle;
                 if (hwnd == IntPtr.Zero) return;
 
-                if (File.Exists(icoPath))
+                // Ensure WS_MINIMIZEBOX | WS_SYSMENU on the borderless window so clicking the
+                // Windows taskbar icon toggles between Normal and Minimized natively.
+                int style = GetWindowLong(hwnd, GWL_STYLE);
+                SetWindowLong(hwnd, GWL_STYLE, style | WS_MINIMIZEBOX | WS_SYSMENU);
+
+                int bigW = GetSystemMetrics(SM_CXICON);
+                int bigH = GetSystemMetrics(SM_CYICON);
+                int smW = GetSystemMetrics(SM_CXSMICON);
+                int smH = GetSystemMetrics(SM_CYSMICON);
+                if (bigW <= 0) bigW = 32;
+                if (bigH <= 0) bigH = 32;
+                if (smW <= 0) smW = 16;
+                if (smH <= 0) smH = 16;
+
+                if (winBigIcon == null || winSmallIcon == null)
                 {
-                    winBigIcon = new Drawing.Icon(icoPath, 48, 48);
-                    winSmallIcon = new Drawing.Icon(icoPath, 16, 16);
-                }
-                else
-                {
-                    string exePath = Process.GetCurrentProcess().MainModule.FileName;
-                    Drawing.Icon exeIcon = Drawing.Icon.ExtractAssociatedIcon(exePath);
-                    if (exeIcon != null)
+                    if (File.Exists(icoPath))
                     {
-                        winBigIcon = exeIcon;
-                        winSmallIcon = exeIcon;
+                        // Load exact SM_CXICON (e.g. 40x40 at 125% DPI) for ICON_BIG and
+                        // exact SM_CXSMICON (e.g. 20x20 at 125% DPI) for ICON_SMALL so Windows
+                        // uses our pre-sharpened native frame without bilinear resampling.
+                        winBigIcon = new Drawing.Icon(icoPath, bigW, bigH);
+                        winSmallIcon = new Drawing.Icon(icoPath, smW, smH);
+                    }
+                    else
+                    {
+                        string exePath = Process.GetCurrentProcess().MainModule.FileName;
+                        Drawing.Icon exeIcon = Drawing.Icon.ExtractAssociatedIcon(exePath);
+                        if (exeIcon != null)
+                        {
+                            winBigIcon = exeIcon;
+                            winSmallIcon = exeIcon;
+                        }
                     }
                 }
 
@@ -589,11 +735,36 @@ namespace MsiScenarioLite
                 if (winSmallIcon != null)
                 {
                     SendMessage(hwnd, WM_SETICON, (IntPtr)0, winSmallIcon.Handle);
-                    SendMessage(hwnd, WM_SETICON, (IntPtr)2, winSmallIcon.Handle);
                     SetClassLongPtrSafe(hwnd, GCLP_HICONSM, winSmallIcon.Handle);
                 }
             }
             catch { }
+        }
+
+        private void ToggleWindowsStartup()
+        {
+            EcHardwareController.StartupRegistrationState cur = EcHardwareController.ReadWindowsStartupState();
+            bool targetEnable = (cur != EcHardwareController.StartupRegistrationState.Enabled);
+
+            string err;
+            bool ok = EcHardwareController.SetWindowsStartupEnabled(targetEnable, out err);
+            lastStartupState = EcHardwareController.ReadWindowsStartupState();
+            RefreshHardwareState(false);
+
+            if (!ok)
+            {
+                txtEcStatus.Text = "⚠️ 设置开机自启失败: " + err;
+                return;
+            }
+
+            if (targetEnable)
+            {
+                txtEcStatus.Text = "✓ 已开启【开机自启】（已同步至 Windows 设置 → 应用 → 启动）";
+            }
+            else
+            {
+                txtEcStatus.Text = "● 已关闭【开机自启】（Windows 设置 → 应用 → 启动已同步关闭）";
+            }
         }
 
         private string TryAutoRestoreScenarioOnStartup()
@@ -664,6 +835,9 @@ namespace MsiScenarioLite
             menu.MenuItems.Add(menuBalanced);
             menu.MenuItems.Add(menuSilent);
             menu.MenuItems.Add("-");
+
+            menuWindowsStartup = new WinForms.MenuItem("开机自启 (同步 Windows 设置 → 应用 → 启动)", (s, e) => ToggleWindowsStartup());
+            menu.MenuItems.Add(menuWindowsStartup);
 
             menuAutoRestoreScenario = new WinForms.MenuItem("启动时恢复上次场景 (默认关闭: 重启恢复均衡)", (s, e) => ToggleAutoRestoreScenario());
             menu.MenuItems.Add(menuAutoRestoreScenario);
@@ -1000,6 +1174,41 @@ namespace MsiScenarioLite
                 VerticalAlignment = VerticalAlignment.Center
             };
 
+            btnWindowsStartup = new Border
+            {
+                VerticalAlignment = VerticalAlignment.Center,
+                Background = new SolidColorBrush(Color.FromRgb(25, 31, 56)),
+                BorderBrush = new SolidColorBrush(Color.FromRgb(58, 70, 114)),
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(7),
+                Padding = new Thickness(9, 5, 9, 5),
+                Margin = new Thickness(0, 0, 7, 0),
+                Cursor = Cursors.Hand,
+                ToolTip = "与 Windows 设置 → 应用 → 启动 实时双向同步。开启后开机自动后台驻留托盘；若在 Windows 设置中关闭，此处也会自动感知并显示已禁用。"
+            };
+            StackPanel wsStack = new StackPanel { Orientation = Orientation.Horizontal };
+            dotWindowsStartup = new Ellipse
+            {
+                Width = 8,
+                Height = 8,
+                Fill = new SolidColorBrush(Color.FromRgb(110, 120, 150)),
+                VerticalAlignment = VerticalAlignment.Center,
+                Margin = new Thickness(0, 0, 6, 0)
+            };
+            txtWindowsStartup = new TextBlock
+            {
+                Text = "开机自启: 关",
+                Foreground = new SolidColorBrush(Color.FromRgb(185, 196, 228)),
+                FontSize = 11.5,
+                FontWeight = FontWeights.SemiBold,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            wsStack.Children.Add(dotWindowsStartup);
+            wsStack.Children.Add(txtWindowsStartup);
+            btnWindowsStartup.Child = wsStack;
+            btnWindowsStartup.MouseLeftButtonDown += (s, e) => ToggleWindowsStartup();
+            headerRightStack.Children.Add(btnWindowsStartup);
+
             btnAutoRestoreScenario = new Border
             {
                 VerticalAlignment = VerticalAlignment.Center,
@@ -1007,8 +1216,8 @@ namespace MsiScenarioLite
                 BorderBrush = new SolidColorBrush(Color.FromRgb(58, 70, 114)),
                 BorderThickness = new Thickness(1),
                 CornerRadius = new CornerRadius(7),
-                Padding = new Thickness(10, 5, 10, 5),
-                Margin = new Thickness(0, 0, 8, 0),
+                Padding = new Thickness(9, 5, 9, 5),
+                Margin = new Thickness(0, 0, 7, 0),
                 Cursor = Cursors.Hand,
                 ToolTip = "主板 EC 在每次重启后默认重置为均衡模式 (0xC1)。开启此项后，每次启动本软件时将自动重新下发上次保存的场景模式。"
             };
@@ -1023,7 +1232,7 @@ namespace MsiScenarioLite
             };
             txtAutoRestoreScenario = new TextBlock
             {
-                Text = "重启恢复均衡 (默认)",
+                Text = "启动恢复场景: 关",
                 Foreground = new SolidColorBrush(Color.FromRgb(185, 196, 228)),
                 FontSize = 11.5,
                 FontWeight = FontWeights.SemiBold,
@@ -1042,7 +1251,7 @@ namespace MsiScenarioLite
                 BorderBrush = new SolidColorBrush(Color.FromRgb(58, 70, 114)),
                 BorderThickness = new Thickness(1),
                 CornerRadius = new CornerRadius(7),
-                Padding = new Thickness(11, 5, 11, 5),
+                Padding = new Thickness(10, 5, 10, 5),
                 Cursor = Cursors.Hand
             };
             StackPanel cbStack = new StackPanel { Orientation = Orientation.Horizontal };
@@ -1091,7 +1300,7 @@ namespace MsiScenarioLite
             cardGaming = CreateScenarioCard(
                 "游戏模式",
                 "极致性能 + 自动强冷 (0xC4)",
-                "保留 BIOS 110W 上限并开启满速散热",
+                "不限制 BIOS 功耗上限并开启满速散热",
                 "extreme.png",
                 out badgeGaming,
                 () => ApplyScenarioAsync(0xC4, true));
@@ -1304,7 +1513,7 @@ namespace MsiScenarioLite
             };
             TextBlock lblPerfLeft = new TextBlock
             {
-                Text = "性能 · 绕过核显直通 RTX 4060",
+                Text = "性能 · 绕过核显直通独立显卡",
                 Foreground = new SolidColorBrush(Color.FromRgb(235, 58, 82)),
                 FontSize = 11.5,
                 FontWeight = FontWeights.SemiBold,
@@ -1631,12 +1840,55 @@ namespace MsiScenarioLite
                 ApplyCardStyle(cardBalanced, badgeBalanced, isBalanced, activeBorder, inactiveBorder, activeBg, inactiveBg, animate);
                 ApplyCardStyle(cardSilent, badgeSilent, isSilent, activeBorder, inactiveBorder, activeBg, inactiveBg, animate);
 
+                EcHardwareController.StartupRegistrationState startupState = EcHardwareController.ReadWindowsStartupState();
+                if (animate && startupState != lastStartupState)
+                {
+                    if (startupState == EcHardwareController.StartupRegistrationState.DisabledByWindowsSettings)
+                    {
+                        txtEcStatus.Text = "⚠️ 检测到【开机自启】已在 Windows 设置 → 应用 → 启动 中被关闭";
+                    }
+                    else if (startupState == EcHardwareController.StartupRegistrationState.Enabled)
+                    {
+                        txtEcStatus.Text = "✓ 检测到【开机自启】已在 Windows 设置 → 应用 → 启动 中开启";
+                    }
+                    else
+                    {
+                        txtEcStatus.Text = "● 检测到【开机自启】已移除";
+                    }
+                }
+                lastStartupState = startupState;
+
+                if (startupState == EcHardwareController.StartupRegistrationState.Enabled)
+                {
+                    btnWindowsStartup.BorderBrush = new SolidColorBrush(Color.FromRgb(64, 148, 255));
+                    btnWindowsStartup.Background = new SolidColorBrush(Color.FromRgb(22, 38, 72));
+                    dotWindowsStartup.Fill = new SolidColorBrush(Color.FromRgb(92, 214, 148));
+                    txtWindowsStartup.Text = "开机自启: 开启";
+                    txtWindowsStartup.Foreground = Brushes.White;
+                }
+                else if (startupState == EcHardwareController.StartupRegistrationState.DisabledByWindowsSettings)
+                {
+                    btnWindowsStartup.BorderBrush = new SolidColorBrush(Color.FromRgb(180, 130, 56));
+                    btnWindowsStartup.Background = new SolidColorBrush(Color.FromRgb(42, 32, 24));
+                    dotWindowsStartup.Fill = new SolidColorBrush(Color.FromRgb(245, 182, 66));
+                    txtWindowsStartup.Text = "开机自启: 设置已关";
+                    txtWindowsStartup.Foreground = new SolidColorBrush(Color.FromRgb(255, 215, 130));
+                }
+                else
+                {
+                    btnWindowsStartup.BorderBrush = new SolidColorBrush(Color.FromRgb(58, 70, 114));
+                    btnWindowsStartup.Background = new SolidColorBrush(Color.FromRgb(25, 31, 56));
+                    dotWindowsStartup.Fill = new SolidColorBrush(Color.FromRgb(110, 120, 150));
+                    txtWindowsStartup.Text = "开机自启: 关";
+                    txtWindowsStartup.Foreground = new SolidColorBrush(Color.FromRgb(185, 196, 228));
+                }
+
                 if (autoRestoreScenarioEnabled)
                 {
                     btnAutoRestoreScenario.BorderBrush = new SolidColorBrush(Color.FromRgb(64, 148, 255));
                     btnAutoRestoreScenario.Background = new SolidColorBrush(Color.FromRgb(22, 38, 72));
                     dotAutoRestoreScenario.Fill = new SolidColorBrush(Color.FromRgb(92, 214, 148));
-                    txtAutoRestoreScenario.Text = "启动恢复上次场景: 开启";
+                    txtAutoRestoreScenario.Text = "启动恢复场景: 开启";
                     txtAutoRestoreScenario.Foreground = Brushes.White;
                 }
                 else
@@ -1644,7 +1896,7 @@ namespace MsiScenarioLite
                     btnAutoRestoreScenario.BorderBrush = new SolidColorBrush(Color.FromRgb(58, 70, 114));
                     btnAutoRestoreScenario.Background = new SolidColorBrush(Color.FromRgb(25, 31, 56));
                     dotAutoRestoreScenario.Fill = new SolidColorBrush(Color.FromRgb(110, 120, 150));
-                    txtAutoRestoreScenario.Text = "启动恢复上次场景: 关(默认均衡)";
+                    txtAutoRestoreScenario.Text = "启动恢复场景: 关(默认均衡)";
                     txtAutoRestoreScenario.Foreground = new SolidColorBrush(Color.FromRgb(185, 196, 228));
                 }
 
@@ -1683,6 +1935,13 @@ namespace MsiScenarioLite
                     menuGaming.Checked = isGaming;
                     menuBalanced.Checked = isBalanced;
                     menuSilent.Checked = isSilent;
+                    if (menuWindowsStartup != null)
+                    {
+                        menuWindowsStartup.Checked = (startupState == EcHardwareController.StartupRegistrationState.Enabled);
+                        menuWindowsStartup.Text = (startupState == EcHardwareController.StartupRegistrationState.DisabledByWindowsSettings)
+                            ? "开机自启 (已在 Windows 设置 → 启动 中被禁用)"
+                            : "开机自启 (同步 Windows 设置 → 应用 → 启动)";
+                    }
                     if (menuAutoRestoreScenario != null) menuAutoRestoreScenario.Checked = autoRestoreScenarioEnabled;
                     menuCoolerBoost.Checked = currentCoolerBoost;
                     bool targetMux = stagedIsDiscrete.HasValue ? stagedIsDiscrete.Value : currentIsDiscrete;
@@ -1802,8 +2061,21 @@ namespace MsiScenarioLite
         [STAThread]
         public static int Main(string[] args)
         {
+            bool startMinimized = false;
+            if (args != null)
+            {
+                for (int i = 0; i < args.Length; i++)
+                {
+                    if (string.Equals(args[i], "--minimized", StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(args[i], "-m", StringComparison.OrdinalIgnoreCase))
+                    {
+                        startMinimized = true;
+                    }
+                }
+            }
+
             Application app = new Application();
-            app.Run(new MainWindow());
+            app.Run(new MainWindow(startMinimized));
             return 0;
         }
     }
