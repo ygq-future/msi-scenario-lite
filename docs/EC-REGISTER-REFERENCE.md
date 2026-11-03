@@ -1,6 +1,6 @@
 # MSI EC / WMI 寄存器参考
 
-> 本文档记录 [`MSI Scenario Lite`](../README.md) 用到的全部底层接口，来自对 MSI Center 托管程序集（`API_NB_Base Module.dll`、`UC_NB_Base Module.dll`、`MSIWMIACPI2.dll`、`ResetUEFIVariable.exe`）与 EC 行为日志（`WmiAcpi2.log`）的静态/动态分析。
+> 本文档记录 [`MSI Scenario Lite`](../README.md) 用到的全部底层接口，来自对 MSI Center 托管程序集（`API_NB_Base Module.dll`、`UC_NB_Base Module.dll`、`MSIWMIACPI2.dll`）与 EC 行为日志（`WmiAcpi2.log`）的静态/动态分析。
 >
 > **适用范围**：微星笔记本 + `WMIACPI 2.8` + EC 固件 `17KKIMS1.115`（Alpha 17 C7VF）。**其他机型 / 固件版本请先只读验证。**
 
@@ -17,14 +17,6 @@ MsiScenarioLite.exe
 ```
 
 关键点：这条链路**不依赖任何微星后台服务**。卸载 MSI Center 后，只要 `wmiacpi.sys` 与主板 ACPI 表存在，接口照常可用。
-
-UEFI 变量走另一条独立通道：
-
-```text
-UEFIVaribleDll.dll
-  └── GetFirmwareEnvironmentVariableW / SetFirmwareEnvironmentVariableW  (kernel32)
-        └── UEFI NVRAM
-```
 
 ---
 
@@ -81,80 +73,48 @@ rpm = 478000 / raw        // raw == 0 时视为 0 RPM
 
 ```csharp
 var res = Wmi.InvokeWmiMethod(Methods.Get_Device, (byte)1, null);
-bool discreteActive = (res.Data[0] & 0x40) != 0;   // bit6
+bool discreteActive = (res.Data[0] & 0x40) != 0;   // bit6: 0x5B=Discrete, 0x1B=MSHybrid
 ```
 
 `0x40` 置位 = 独显直连（Discrete），清零 = 混合输出（MSHybrid）。
 
-### 4.2 读取"下次启动的预约状态"
+### 4.2 `EC 0xD1`（`Get_AP(0).Data[1]`）固件状态机
+
+MSI Center 在 `C_GeneralSettings.SetStatus("GraphicsSwithc")` 中切换显卡模式时，仅对 `EC 0xD1` 写入 `(b & 0xFC) | 0x01`。
+
+当向 `0xD1` 写入 **bit 0 = 1**（如 `0x01` 或 `0x05`）时，EC 固件内部中断处理函数会：
+1. 将「下次开机目标 MUX 模式」翻转（Discrete ↔ MSHybrid）；
+2. 自动清零 bit 0（`0x01`），置起 bit 1（`0x02`，表示本次开机周期内触发过切换命令）；
+3. 将 **bit 2（`0x04`）** 更新为翻转后的**下次开机目标模式**：
+
+| `Get_AP(0).Data[1]` (`0xD1`) 回读值 | 含义 | 下次重启生效模式 |
+| :---: | :--- | :--- |
+| `0x00` | 本次开机后未触发过切换 | 保持当前运行模式（`discreteActive`） |
+| **`0x06`** (`bit2=1, bit1=1`) | 已标记下次开机为独显直连 | **独显直连 (Discrete)** |
+| **`0x02`** (`bit2=0, bit1=1`) | 已标记下次开机为混合输出 | **混合输出 (MSHybrid)** |
+
+因此，读取下次启动预约模式的完整逻辑直接来自 `EC 0xD1`：
 
 ```csharp
-var ap = Wmi.InvokeWmiMethod(Methods.Get_AP, (byte)0, null);
-bool pending = (ap.Data[1] & 0x03) != 0;
+byte d1 = ReadEcD1(); // Get_AP(0).Data[1]
+bool stagedIsDiscrete = ((d1 & 0x02) != 0) ? ((d1 & 0x04) != 0) : discreteActive;
 ```
 
-`Data[1]` 低两位是**切换锁存**，不是模式编码。
+### 4.3 写入与取消预约的正确方式
 
-### 4.3 写入语义（关键，容易踩坑）
-
-`EC 0xD1` 的低两位是 **toggle latch（翻转锁存）**，而不是"独显=1 / 混合=2"：
-
-| 操作 | 写入值 | 回读 `Get_AP(0).Data[1]` |
-| :--- | :--- | :--- |
-| 预约下次重启翻转 MUX | `(b & 0xFC) \| 0x01`（通常为 `0x05`） | `0x06`（bit1 被固件置起，表示"已挂起"） |
-| 取消预约 / 回到当前模式 | `b & 0xFC`（通常为 `0x04`） | `0x04` |
-
-因为固件会把 bit0 吸收并置起 bit1，**不要**通过回读值反推"目标模式"；正确做法是结合当前 MUX 状态判断：
+无论是「预约切换到另一模式」还是「取消预约切回原模式」，**都必须向 `0xD1` 写入 `(b & 0xFC) | 0x01`（bit 0 = 1）** 以触发 EC 固件翻转处理器，并在写后回读校验 `Data[1]` 是否变为预期的 `0x06`（独显）或 `0x02`（混合）：
 
 ```text
-pending ? (current == Discrete ? 目标为 MSHybrid : 目标为 Discrete)
-        : current
+开机初始 (Discrete, 0xD1=0x00)
+  ├─ 点击混合输出：写 0x01 → EC 翻转目标并回读 0x02 (Staged = MSHybrid)
+  └─ 再次点击独显直连（取消预约）：写 0x01 → EC 再次翻转目标并回读 0x06 (Staged = Discrete)
 ```
 
-### 4.4 UEFI 变量（实测校正）
+> ⚠️ **切勿向 `0xD1` 写入 `0x04`（bit 0 = 0）**：当 bit 0 为 0 时，EC 固件不会触发内部的 MUX 翻转逻辑（下次重启目标仍停留在上一次翻转后的状态），但却把 `0xD1` 寄存器字节覆盖成了 `0x04`，掩盖了真实的 `0x02 / 0x06` 状态回读。
 
-| 项 | 值 |
-| :--- | :--- |
-| 变量名 | `MsiDCVarData` |
-| GUID | `{DD96BAAF-145E-4F56-B1CF-193256298E99}` |
-| 数据长度 | **20 字节**（不是 72，也不是 4096） |
-| 关键字节 | **`buffer[0]`**：`0` / `1`，决定下次开机使用的 MUX 模式 |
-| 权限 | `SeSystemEnvironmentPrivilege`（管理员令牌中默认禁用，需要 `AdjustTokenPrivileges` 显式开启） |
+### 4.4 关于 UEFI 变量 `MsiDCVarData` 的说明
 
-**不要**通过 `UEFIVaribleDll.dll` 的旧式导出调用：该 DLL 实际只导出 `GetUEFIVariableEx` / `SetUEFIVariableEx`，名字与签名都和 `GetVariable` / `SetVariable` 不同。直接调用 `kernel32` 更稳：
-
-```csharp
-[DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-static extern uint GetFirmwareEnvironmentVariableW(string name, string guid, byte[] buffer, uint size);
-
-[DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-static extern bool SetFirmwareEnvironmentVariableW(string name, string guid, byte[] buffer, uint size);
-```
-
-读 → 改 `buffer[0]` → 写回同一长度 → **再次读取校验**。示例（本机实测）：
-
-```text
-size=20 byte[0]=1            # 当前为混合输出
-set 0 -> ok=True             # 目标：独显直连
-after set: size=20 byte[0]=0
-```
-
-> ⚠️ 早期版本的 `MSI Scenario Lite` 误把关键字节写成 `buffer[58]`、写入长度写成 72，且 P/Invoke 入口点名字错误（`CheckPrivileges` / `GetVariable` / `SetVariable` 在 DLL 中并不存在），导致每次都静默回退到 `ResetUEFIVariable.exe` 的盲翻转。该路径已删除，改为上面的显式读写 + 校验。
-
-### 4.5 为什么不能依赖 EC 0xD1 判断"是否已预约切换"
-
-`ResetUEFIVariable.exe`（或显式写变量）执行后，EC 的 `0xD1` 低两位会被固件清掉。实测日志：
-
-```text
-applied current=Hybrid target=Discrete uefi 1->0 size=20 latch=0x05
-# 稍后再次读取 Get_AP(0).Data[1] 已经不再是"pending"状态
-```
-
-因此**不要**用 `0xD1` 回读值推断"是否还有未生效的切换"。正确做法：
-
-1. 自己持久化"下次启动目标模式"（例如 `%LOCALAPPDATA%\MsiScenarioLite\gpu-target.txt`）；
-2. 以持久化值为准，`0xD1` 只作为"外部（如 MSI Center）刚发起切换"的辅助信号；
-3. 每次写入后回读 UEFI 变量校验，并记录日志。
+微星目录中的 `ResetUEFIVariable.exe` 与 `UEFIVaribleDll.dll` 操作的 UEFI 变量 `MsiDCVarData`（GUID `{DD96BAAF-145E-4F56-B1CF-193256298E99}`）属于 `API_NB_Base Module.dll` 的 **`WinAndFnChange`（Win/Fn 键位互换）** 及卸载清理逻辑，与显卡 MUX 切换无关。显卡模式切换仅需操作 `EC 0xD1`。
 
 ---
 
@@ -204,8 +164,8 @@ WHERE Hive='HKEY_LOCAL_MACHINE'
 
 | 坑 | 说明 |
 | :--- | :--- |
-| `0xD1` 不是模式编码 | 是 toggle latch；回读值不代表目标模式 |
-| `ResetUEFIVariable.exe` 是盲翻转 | 重复调用会把标记改回去 |
+| `0xD1` 必须以 bit0=1 触发翻转 | 写 `(b & 0xFC) \| 0x01` 后固件将 `0xD1` 更新为 `0x06`（独显）或 `0x02`（混合）；若写 `0x04`（bit0=0）不会触发固件翻转且会覆盖状态位 |
+| `0xD2` 重启后硬件重置为 `0xC1` | 主板 EC 在每次重启后默认将场景恢复为均衡模式（`0xC1`），需持久化的场景可在软件启动时自动重放 |
 | 内部索引 `3` 是废弃分支 | 会触发 2 秒后被改回 `0xC1`；静音应使用 `4` |
 | 写 `0x50 / 0x51` 会覆盖 BIOS 功耗墙 | 本工具不写；原版 MSI Center 会写 |
 | 注册表写入需要管理员 | 程序已内嵌 `requireAdministrator` |
@@ -218,10 +178,11 @@ WHERE Hive='HKEY_LOCAL_MACHINE'
 在信任任何写操作之前，先跑一遍只读检查：
 
 ```csharp
-byte shift   = ReadShiftByte();               // 0xC1 / 0xC2 / 0xC4
-bool boost   = ReadCoolerBoost();             // 强冷是否开启
-bool discrete = ReadIsDiscreteGpuMode();      // 当前 MUX
-bool? staged  = ReadStagedGpuModeIsDiscrete();// 下次启动预约
+byte shift    = ReadShiftByte();                                    // 0xC1 / 0xC2 / 0xC4
+bool boost    = ReadCoolerBoost();                                  // 强冷是否开启
+bool discrete = ReadIsDiscreteGpuMode();                            // 当前 MUX
+byte d1;
+bool staged   = ReadStagedGpuModeIsDiscrete(discrete, out d1);      // 下次启动预约 (0x00 / 0x02 / 0x06)
 ```
 
 若这些值与你实际观察到的系统行为一致，说明寄存器语义匹配，可以继续。

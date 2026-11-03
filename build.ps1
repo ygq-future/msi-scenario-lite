@@ -3,7 +3,7 @@
     Builds MsiScenarioLite.exe using the .NET Framework compiler shipped with Windows.
 
 .DESCRIPTION
-    No Visual Studio / .NET SDK required. Requires the three MSI dependencies in the
+    No Visual Studio / .NET SDK required. Requires MSIWMIACPI2.dll in the
     repository root - run tools\Prepare-Dependencies.ps1 first.
 #>
 [CmdletBinding()]
@@ -20,7 +20,7 @@ if (-not (Test-Path $csc)) {
     throw "csc.exe not found at $csc. .NET Framework 4.x is required."
 }
 
-$dependencies = @('MSIWMIACPI2.dll', 'ResetUEFIVariable.exe', 'UEFIVaribleDll.dll')
+$dependencies = @('MSIWMIACPI2.dll')
 $missing = $dependencies | Where-Object { -not (Test-Path (Join-Path $root $_)) }
 if ($missing) {
     throw "Missing dependency: $($missing -join ', '). Run tools\Prepare-Dependencies.ps1 first."
@@ -52,4 +52,4 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Host "Built $out" -ForegroundColor Green
-Write-Host "Runtime layout: MsiScenarioLite.exe + Assets\ + the three MSI dependencies (all in this folder)."
+Write-Host "Runtime layout: MsiScenarioLite.exe + Assets\ + MSIWMIACPI2.dll (all in this folder)."

@@ -28,9 +28,10 @@ MSI Center 做三件很小的事，却要付出很大代价：
 - **三档使用场景**：游戏模式（`EC 0xD2 = 0xC4`）、均衡模式（`0xC1`）、节能静音模式（`0xC2`）
   - 切到游戏模式时**自动开启强冷**（`EC 0x98 |= 0x80`），与 MSI Center 的 Extreme 预设一致
   - 切回均衡 / 静音时自动交还 EC 原生温度曲线（`EC 0xD4` bit 7 清零）
+  - **支持可选「启动恢复上次场景」**：主板 EC 在每次重启后默认将 `0xD2` 恢复为均衡模式（`0xC1`）；面板右上角与托盘菜单提供一键开关，开启后每次启动自动恢复上次保存的场景
   - **绝不写 `0x50 / 0x51`**，BIOS 里的 `PPT / TDC / EDC` 原样保留
 - **强冷开关**：可脱离场景单独开关
-- **显卡模式切换（MUX）**：只写 `EC 0xD1` 与 UEFI 变量 `MsiDCVarData`，**下次重启自动生效**；再次点击原模式可随时取消预约，**任何情况下都不会强制重启**
+- **显卡模式切换（MUX）**：通过 `EC 0xD1` 预约切换并实时回读状态位（`0x06` = 独显直连、`0x02` = 混合输出），**下次重启自动生效**；再次点击原模式可随时取消预约，**任何情况下都不会强制重启**
 - **系统托盘常驻**：双击呼出面板，右键可直接切换模式 / 强冷 / 显卡模式
 - **实时遥测**：CPU / GPU 温度与风扇转速（直接读 EC，不依赖第三方驱动）
 - **与原版 MSI Center 状态同步**：可选；即使已卸载也不会报错（自动降级为独立模式）
@@ -56,7 +57,7 @@ MSI Center 做三件很小的事，却要付出很大代价：
 
 ## 构建
 
-仓库**不包含**任何微星专有二进制文件（`MSIWMIACPI2.dll`、`ResetUEFIVariable.exe`、`UEFIVaribleDll.dll`）。它们由脚本从**你本地已安装**的 MSI Center 中复制，不随仓库分发。
+仓库**不包含**微星专有二进制文件（`MSIWMIACPI2.dll`）。它由脚本从**你本地已安装**的 MSI Center 中复制，不随仓库分发。
 
 ```powershell
 # 1. 从本地 MSI Center 安装目录复制所需依赖（不下载任何东西）
@@ -66,7 +67,7 @@ powershell -ExecutionPolicy Bypass -File .\tools\Prepare-Dependencies.ps1
 powershell -ExecutionPolicy Bypass -File .\build.ps1
 ```
 
-产物：仓库根目录的 `MsiScenarioLite.exe`。运行目录需包含 `Assets\` 与上述三个微星依赖 DLL/EXE（即仓库根目录本身）。
+产物：仓库根目录的 `MsiScenarioLite.exe`。运行目录需包含 `Assets\` 与 `MSIWMIACPI2.dll`（即仓库根目录本身）。
 
 ### 编码约定（改脚本前必读）
 
@@ -96,13 +97,13 @@ tools\Restore-MSICenter.bat   # 需要时一键恢复
 
 > 注意：Windows「设置 → 应用 → 启动」里的 **MSI Center** 属于 AppX 的 `StartupTask`，**不受服务/计划任务禁用影响**，需要单独关闭（脚本已包含这一步）。
 
-禁用后本工具仍完全可用（它只依赖系统自带的 `wmiacpi.sys` 与 UEFI 变量 API）。`Micro Star SCM`（Fn 快捷键服务）不会被改动。
+禁用后本工具仍完全可用（它只依赖系统自带的 `wmiacpi.sys`）。`Micro Star SCM`（Fn 快捷键服务）不会被改动。
 
 ### 辅助脚本（`tools\`）
 
 | 脚本 | 用途 |
 | :--- | :--- |
-| `Prepare-Dependencies.ps1` | 从本地 MSI Center 复制三个专有依赖 |
+| `Prepare-Dependencies.ps1` | 从本地 MSI Center 复制 `MSIWMIACPI2.dll` |
 | `Disable-MSICenter.bat` | 一键禁用原版后台服务、UWP 启动项与开机任务（自动提权） |
 | `Restore-MSICenter.bat` | 一键恢复原版后台服务、UWP 启动项与开机任务（自动提权） |
 | `MSICenter-Startup.ps1` | 单独控制「设置 → 应用 → 启动」里的 MSI Center 项（`-Disable` / `-Enable` / `-Status`） |
@@ -123,8 +124,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\WHEA-Alert.ps1 -Unin
 
 ```text
 MsiScenarioLite.exe
-   ├── MSIWMIACPI2.dll  →  root\WMI  →  wmiacpi.sys  →  主板 EC 寄存器
-   └── UEFIVaribleDll.dll →  Get/SetFirmwareEnvironmentVariable  →  UEFI NVRAM
+   └── MSIWMIACPI2.dll  →  root\WMI  →  wmiacpi.sys  →  主板 EC 寄存器 (0xD2 / 0x98 / 0xD4 / 0xD1)
 ```
 
 详细寄存器表、位定义与逆向过程见 [`docs/EC-REGISTER-REFERENCE.md`](docs/EC-REGISTER-REFERENCE.md)。

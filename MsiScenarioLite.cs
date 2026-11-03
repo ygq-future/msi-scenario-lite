@@ -8,6 +8,7 @@ using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
+using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
 using System.Windows.Media.Imaging;
@@ -20,92 +21,25 @@ using Drawing = System.Drawing;
 
 [assembly: AssemblyTitle("MSI Scenario Lite")]
 [assembly: AssemblyProduct("MSI Scenario Lite (MSI EC / WMIACPI)")]
-[assembly: AssemblyVersion("1.4.0.0")]
+[assembly: AssemblyVersion("1.5.0.0")]
 
 namespace MsiScenarioLite
 {
     public static class EcHardwareController
     {
-        // ---- UEFI variable MsiDCVarData --------------------------------------------
-        // Real layout (verified on Alpha 17 C7VF): 20 bytes, byte[0] selects the MUX
-        // mode used at the next boot (0 / 1). MSI's UEFIVaribleDll.dll only exports
-        // GetUEFIVariableEx / SetUEFIVariableEx, so we call kernel32 directly instead.
-
-        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-        private static extern uint GetFirmwareEnvironmentVariableW(string name, string guid, byte[] buffer, uint size);
-
-        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-        private static extern bool SetFirmwareEnvironmentVariableW(string name, string guid, byte[] buffer, uint size);
-
-        [DllImport("advapi32.dll", SetLastError = true)]
-        private static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
-
-        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-        private static extern bool LookupPrivilegeValue(string system, string name, out long luid);
-
-        [DllImport("advapi32.dll", SetLastError = true)]
-        private static extern bool AdjustTokenPrivileges(IntPtr token, bool disableAll, IntPtr newState, uint len, IntPtr prev, out uint retLen);
-
-        [DllImport("kernel32.dll")]
-        private static extern IntPtr GetCurrentProcess();
-
-        private const string MsiUefiVarName = "MsiDCVarData";
-        private const string MsiUefiVarGuid = "{DD96BAAF-145E-4F56-B1CF-193256298E99}";
-
-        private static bool uefiPrivilegeReady;
-
-        private static bool EnsureUefiPrivilege()
-        {
-            if (uefiPrivilegeReady) return true;
-
-            IntPtr token;
-            if (!OpenProcessToken(GetCurrentProcess(), 0x0020 | 0x0008, out token)) return false;
-
-            long luid;
-            if (!LookupPrivilegeValue(null, "SeSystemEnvironmentPrivilege", out luid)) return false;
-
-            IntPtr state = Marshal.AllocHGlobal(16);
-            try
-            {
-                Marshal.WriteInt32(state, 0, 1);
-                Marshal.WriteInt64(state, 4, luid);
-                Marshal.WriteInt32(state, 12, 2);
-
-                uint returned;
-                if (!AdjustTokenPrivileges(token, false, state, 0, IntPtr.Zero, out returned)) return false;
-                if (Marshal.GetLastWin32Error() != 0) return false;   // 1300 = not assigned
-
-                uefiPrivilegeReady = true;
-                return true;
-            }
-            finally
-            {
-                Marshal.FreeHGlobal(state);
-            }
-        }
-
-        private static byte[] ReadGpuUefiRaw(out uint size)
-        {
-            size = 0;
-            if (!EnsureUefiPrivilege()) return null;
-
-            byte[] buffer = new byte[64];
-            uint read = GetFirmwareEnvironmentVariableW(MsiUefiVarName, MsiUefiVarGuid, buffer, (uint)buffer.Length);
-            if (read == 0 || read > buffer.Length) return null;
-
-            size = read;
-            return buffer;
-        }
-
-        private static bool WriteGpuUefiRaw(byte[] buffer, uint size)
-        {
-            if (!EnsureUefiPrivilege()) return false;
-            return SetFirmwareEnvironmentVariableW(MsiUefiVarName, MsiUefiVarGuid, buffer, size);
-        }
-
         private static WmiAcpiLib2 Wmi
         {
             get { return WmiAcpiLib2.GlobalInstance; }
+        }
+
+        private static string StateDir
+        {
+            get
+            {
+                return System.IO.Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "MsiScenarioLite");
+            }
         }
 
         public static bool IsAdministrator()
@@ -148,9 +82,74 @@ namespace MsiScenarioLite
                 EnsureAutoFan();
             }
 
+            if (ok)
+            {
+                SaveLastScenario(modeCode);
+            }
+
             // 4. Safely sync MSI Center Registry if MSI Center is still installed; never throws if uninstalled!
             syncStatus = SyncMsiCenterRegistryAndNotifyUI(modeCode);
             return ok;
+        }
+
+        // ---- Scenario persistence across reboots ----------------------------------
+        // Hardware EC resets 0xD2 to 0xC1 (Balanced) and 0x98 to 0x06 on every reboot.
+        // When auto-restore is enabled, we re-apply the last saved scenario on startup.
+
+        public static bool LoadAutoRestoreScenarioEnabled()
+        {
+            try
+            {
+                string path = System.IO.Path.Combine(StateDir, "auto-restore-scenario.txt");
+                if (!System.IO.File.Exists(path)) return false;
+                return System.IO.File.ReadAllText(path).Trim() == "1";
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        public static void SaveAutoRestoreScenarioEnabled(bool enabled)
+        {
+            try
+            {
+                System.IO.Directory.CreateDirectory(StateDir);
+                System.IO.File.WriteAllText(
+                    System.IO.Path.Combine(StateDir, "auto-restore-scenario.txt"),
+                    enabled ? "1" : "0");
+            }
+            catch { }
+        }
+
+        public static byte? LoadLastScenario()
+        {
+            try
+            {
+                string path = System.IO.Path.Combine(StateDir, "last-scenario.txt");
+                if (!System.IO.File.Exists(path)) return null;
+                string text = System.IO.File.ReadAllText(path).Trim();
+                if (text == "C4" || text == "0xC4") return 0xC4;
+                if (text == "C2" || text == "0xC2") return 0xC2;
+                if (text == "C1" || text == "0xC1") return 0xC1;
+                return null;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        public static void SaveLastScenario(byte modeCode)
+        {
+            try
+            {
+                System.IO.Directory.CreateDirectory(StateDir);
+                System.IO.File.WriteAllText(
+                    System.IO.Path.Combine(StateDir, "last-scenario.txt"),
+                    string.Format("0x{0:X2}", modeCode));
+            }
+            catch { }
         }
 
         public static string SyncMsiCenterRegistryAndNotifyUI(byte modeCode)
@@ -249,50 +248,15 @@ namespace MsiScenarioLite
             return true;
         }
 
-        // ---- persisted GPU target -------------------------------------------------
-        // The EC latch (0xD1) is cleared by the firmware once the UEFI variable is
-        // written, so it cannot be used as the source of truth. We persist the
-        // intended next-boot mode ourselves and treat it as authoritative.
-
-        private static string StateDir
-        {
-            get
-            {
-                return System.IO.Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                    "MsiScenarioLite");
-            }
-        }
-
-        public static bool? LoadPersistedGpuTarget()
-        {
-            try
-            {
-                string path = System.IO.Path.Combine(StateDir, "gpu-target.txt");
-                if (!System.IO.File.Exists(path)) return null;
-
-                string text = System.IO.File.ReadAllText(path).Trim();
-                if (text == "1") return true;
-                if (text == "0") return false;
-                return null;
-            }
-            catch
-            {
-                return null;
-            }
-        }
-
-        public static void SavePersistedGpuTarget(bool? target)
-        {
-            try
-            {
-                System.IO.Directory.CreateDirectory(StateDir);
-                System.IO.File.WriteAllText(
-                    System.IO.Path.Combine(StateDir, "gpu-target.txt"),
-                    target.HasValue ? (target.Value ? "1" : "0") : string.Empty);
-            }
-            catch { }
-        }
+        // ---- GPU MUX switching via EC 0xD1 ----------------------------------------
+        // Verified against MSI Center (C_GeneralSettings.SetStatus("GraphicsSwithc"))
+        // and live EC firmware (17KKIMS1.115):
+        //   - Fresh boot: Get_AP(0).Data[1] (EC 0xD1) == 0x00 (no switch staged; stays currentIsDiscrete)
+        //   - Writing (b & 0xFC) | 0x01 triggers the EC MUX toggle handler, which flips
+        //     the next-boot target, clears bit 0, sets bit 1 (0x02), and sets bit 2 (0x04)
+        //     to the staged next-boot mode:
+        //       0x06 (bit 2=1, bit 1=1) => Next boot is Discrete GPU (独显直连)
+        //       0x02 (bit 2=0, bit 1=1) => Next boot is MSHybrid (混合输出)
 
         public static void LogGpu(string message)
         {
@@ -306,98 +270,92 @@ namespace MsiScenarioLite
             catch { }
         }
 
-        private static bool ReadEcSwitchLatch()
+        public static byte ReadEcD1()
         {
             var rAp = Wmi.InvokeWmiMethod(WmiAcpiLib2.Methods.Get_AP, (byte)0, null);
             if (rAp.InvokeMethodResult && rAp.Flag == 1 && rAp.Data != null && rAp.Data.Length > 1)
             {
-                return (rAp.Data[1] & 0x03) != 0;
+                return rAp.Data[1];
             }
-            return false;
-        }
-
-        // Which mode the firmware will boot into next (i.e. what the variable encodes).
-        public static bool ReadEncodedGpuTarget(bool currentDiscrete)
-        {
-            bool? persisted = LoadPersistedGpuTarget();
-            if (persisted.HasValue)
+            var fallback = Wmi.InvokeWmiMethod(WmiAcpiLib2.Methods.Get_Data, (byte)0xD1, null);
+            if (fallback.InvokeMethodResult && fallback.Flag == 1 && fallback.Data != null && fallback.Data.Length > 0)
             {
-                // A persisted value different from the running mode means the switch is
-                // still pending; the EC latch may already be cleared, so trust persistence.
-                return persisted.Value;
+                return fallback.Data[0];
             }
-
-            return ReadEcSwitchLatch() ? !currentDiscrete : currentDiscrete;
+            return 0x00;
         }
 
-        public static bool? ReadStagedGpuModeIsDiscrete()
+        public static bool ReadStagedGpuModeIsDiscrete(bool currentDiscrete, out byte d1)
         {
-            bool currentDiscrete = ReadIsDiscreteGpuMode();
-            bool? persisted = LoadPersistedGpuTarget();
-            if (persisted.HasValue) return persisted.Value;
-
-            return ReadEcSwitchLatch() ? !currentDiscrete : currentDiscrete;
+            d1 = ReadEcD1();
+            if ((d1 & 0x02) != 0)
+            {
+                return (d1 & 0x04) != 0;
+            }
+            return currentDiscrete;
         }
 
         public sealed class GpuApplyResult
         {
             public bool Ok;
             public string Error;
+            public byte ReadbackD1;
         }
 
-        // Deterministic MUX staging: read the 20-byte variable, flip byte[0], write it
-        // back and verify. No blind toggling, no dependency on ResetUEFIVariable.exe.
-        public static GpuApplyResult ApplyGpuTarget(bool targetDiscrete, bool currentDiscrete, bool encodedTarget)
+        public static GpuApplyResult ApplyGpuTarget(bool targetDiscrete, bool currentDiscrete)
         {
             GpuApplyResult result = new GpuApplyResult();
 
-            if (targetDiscrete == encodedTarget)
+            byte beforeD1;
+            bool encodedBefore = ReadStagedGpuModeIsDiscrete(currentDiscrete, out beforeD1);
+            if (encodedBefore == targetDiscrete && (beforeD1 == 0x00 || (beforeD1 & 0x02) != 0))
             {
-                SavePersistedGpuTarget(targetDiscrete);
-                LogGpu(string.Format("no-op  current={0} target={1} (already encoded)",
-                    currentDiscrete ? "Discrete" : "Hybrid", targetDiscrete ? "Discrete" : "Hybrid"));
                 result.Ok = true;
+                result.ReadbackD1 = beforeD1;
+                LogGpu(string.Format("no-op  current={0} target={1} d1=0x{2:X2}",
+                    currentDiscrete ? "Discrete" : "Hybrid",
+                    targetDiscrete ? "Discrete" : "Hybrid",
+                    beforeD1));
                 return result;
             }
 
-            uint size;
-            byte[] raw = ReadGpuUefiRaw(out size);
-            if (raw == null || size < 1)
+            byte expectedD1 = targetDiscrete ? (byte)0x06 : (byte)0x02;
+            byte curD1 = beforeD1;
+
+            for (int attempt = 1; attempt <= 2; attempt++)
             {
-                result.Error = "无法读取 UEFI 变量 MsiDCVarData（需要管理员权限）。";
-                LogGpu("ERROR read MsiDCVarData failed");
-                return result;
+                byte writeVal = (byte)((curD1 & 0xFC) | 0x01);
+                var wRes = Wmi.InvokeWmiMethod(WmiAcpiLib2.Methods.Set_Data, (byte)0xD1, new byte[] { writeVal });
+                if (!wRes.InvokeMethodResult || wRes.Flag != 1)
+                {
+                    result.Error = "写入 EC 0xD1 寄存器失败（请确认以管理员身份运行）。";
+                    LogGpu(string.Format("ERROR Set_Data(0xD1, 0x{0:X2}) failed on attempt {1}", writeVal, attempt));
+                    return result;
+                }
+
+                System.Threading.Thread.Sleep(80);
+                curD1 = ReadEcD1();
+                result.ReadbackD1 = curD1;
+
+                LogGpu(string.Format("attempt={0} current={1} target={2} before=0x{3:X2} wrote=0x{4:X2} after=0x{5:X2}",
+                    attempt,
+                    currentDiscrete ? "Discrete" : "Hybrid",
+                    targetDiscrete ? "Discrete" : "Hybrid",
+                    beforeD1,
+                    writeVal,
+                    curD1));
+
+                if ((curD1 & 0x06) == expectedD1)
+                {
+                    break;
+                }
             }
 
-            byte before = raw[0];
-            raw[0] = (byte)(before == 1 ? 0 : 1);
-
-            if (!WriteGpuUefiRaw(raw, size))
+            if ((result.ReadbackD1 & 0x06) != expectedD1)
             {
-                result.Error = "写入 UEFI 变量 MsiDCVarData 失败。";
-                LogGpu("ERROR write MsiDCVarData failed");
+                result.Error = string.Format("EC 0xD1 状态回读校验未达预期 (0x{0:X2})。", result.ReadbackD1);
                 return result;
             }
-
-            uint verifySize;
-            byte[] verify = ReadGpuUefiRaw(out verifySize);
-            if (verify == null || verify[0] != raw[0])
-            {
-                result.Error = "UEFI 变量写入后校验失败。";
-                LogGpu("ERROR verify MsiDCVarData failed");
-                return result;
-            }
-
-            // Keep the EC latch consistent with MSI's own flow: 0x05 = switch pending, 0x04 = none.
-            var rAp = Wmi.InvokeWmiMethod(WmiAcpiLib2.Methods.Get_AP, (byte)0, null);
-            byte b = 0x04;
-            if (rAp.InvokeMethodResult && rAp.Flag == 1 && rAp.Data != null && rAp.Data.Length > 1) b = rAp.Data[1];
-
-            byte latchBase = (byte)(b & 0xFC);
-            if (latchBase == 0) latchBase = 0x04;   // keep the "no request" baseline sane
-
-            byte latch = (targetDiscrete != currentDiscrete) ? (byte)(latchBase | 0x01) : latchBase;
-            Wmi.InvokeWmiMethod(WmiAcpiLib2.Methods.Set_Data, (byte)0xD1, new byte[] { latch });
 
             try
             {
@@ -412,14 +370,21 @@ namespace MsiScenarioLite
             }
             catch { }
 
-            SavePersistedGpuTarget(targetDiscrete);
-            LogGpu(string.Format("applied current={0} target={1} uefi {2}->{3} size={4} latch=0x{5:X2}",
-                currentDiscrete ? "Discrete" : "Hybrid",
-                targetDiscrete ? "Discrete" : "Hybrid",
-                before, raw[0], size, latch));
-
             result.Ok = true;
             return result;
+        }
+
+        public static string FormatScenarioLabel(byte modeCode, bool includeCoolerBoost)
+        {
+            if (modeCode == 0xC4 || modeCode == 0xC0)
+            {
+                return includeCoolerBoost ? "游戏模式 + 强冷 (0xC4)" : "游戏模式 (0xC4)";
+            }
+            if (modeCode == 0xC2 || modeCode == 0xC3)
+            {
+                return "节能静音模式 (0xC2)";
+            }
+            return "均衡模式 (0xC1)";
         }
 
         public static void ReadTelemetry(out int cpuTemp, out int gpuTemp, out int cpuRpm, out int gpuRpm)
@@ -455,6 +420,25 @@ namespace MsiScenarioLite
 
     public class MainWindow : Window
     {
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern int SetCurrentProcessExplicitAppUserModelID(string AppID);
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto)]
+        private static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("user32.dll", EntryPoint = "SetClassLongPtrW")]
+        private static extern IntPtr SetClassLongPtr64(IntPtr hWnd, int nIndex, IntPtr dwNewLong);
+
+        [DllImport("user32.dll", EntryPoint = "SetClassLongW")]
+        private static extern uint SetClassLong32(IntPtr hWnd, int nIndex, uint dwNewLong);
+
+        private const uint WM_SETICON = 0x0080;
+        private const int GCLP_HICON = -14;
+        private const int GCLP_HICONSM = -34;
+
+        private Drawing.Icon winBigIcon;
+        private Drawing.Icon winSmallIcon;
+
         private Border cardGaming;
         private Border cardBalanced;
         private Border cardSilent;
@@ -462,6 +446,11 @@ namespace MsiScenarioLite
         private TextBlock badgeGaming;
         private TextBlock badgeBalanced;
         private TextBlock badgeSilent;
+
+        private Border btnAutoRestoreScenario;
+        private TextBlock txtAutoRestoreScenario;
+        private Ellipse dotAutoRestoreScenario;
+        private bool autoRestoreScenarioEnabled = false;
 
         private Border btnCoolerBoost;
         private TextBlock txtCoolerBoostState;
@@ -490,6 +479,7 @@ namespace MsiScenarioLite
         private WinForms.MenuItem menuGaming;
         private WinForms.MenuItem menuBalanced;
         private WinForms.MenuItem menuSilent;
+        private WinForms.MenuItem menuAutoRestoreScenario;
         private WinForms.MenuItem menuCoolerBoost;
         private WinForms.MenuItem menuGpuDiscrete;
         private WinForms.MenuItem menuGpuHybrid;
@@ -503,6 +493,9 @@ namespace MsiScenarioLite
 
         public MainWindow()
         {
+            try { SetCurrentProcessExplicitAppUserModelID("MsiScenarioLite.PureEcControl.1"); }
+            catch { }
+
             Title = "MSI Scenario Lite";
             Width = 780;
             SizeToContent = SizeToContent.Height;
@@ -512,24 +505,35 @@ namespace MsiScenarioLite
             AllowsTransparency = true;
             Background = Brushes.Transparent;
 
+            string icoPath = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Assets", "app.ico");
             string logoPngPath = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Assets", "logo.png");
-            string icoPath = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Assets", "app_v2.ico");
-            if (!File.Exists(icoPath))
-            {
-                icoPath = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Assets", "app.ico");
-            }
-            if (File.Exists(logoPngPath))
+            if (File.Exists(icoPath))
             {
                 try
                 {
-                    Icon = LoadAsset("logo.png");
+                    Icon = BitmapFrame.Create(new Uri(icoPath, UriKind.Absolute), BitmapCreateOptions.None, BitmapCacheOption.OnLoad);
                 }
                 catch { }
             }
+            if (Icon == null && File.Exists(logoPngPath))
+            {
+                try { Icon = LoadAsset("logo.png"); }
+                catch { }
+            }
+
+            SourceInitialized += (s, e) => ApplyNativeWindowIcons(icoPath);
+
+            autoRestoreScenarioEnabled = EcHardwareController.LoadAutoRestoreScenarioEnabled();
 
             BuildUI();
             InitSystemTray(icoPath);
+
+            string startupRestoreMsg = TryAutoRestoreScenarioOnStartup();
             RefreshHardwareState(false);
+            if (!string.IsNullOrEmpty(startupRestoreMsg))
+            {
+                txtEcStatus.Text = startupRestoreMsg;
+            }
 
             pollTimer = new DispatcherTimer
             {
@@ -540,6 +544,92 @@ namespace MsiScenarioLite
                 if (!isBusySwitching) RefreshHardwareState(true);
             };
             pollTimer.Start();
+        }
+
+        private static void SetClassLongPtrSafe(IntPtr hWnd, int nIndex, IntPtr value)
+        {
+            if (IntPtr.Size == 8)
+            {
+                SetClassLongPtr64(hWnd, nIndex, value);
+            }
+            else
+            {
+                SetClassLong32(hWnd, nIndex, (uint)value.ToInt64());
+            }
+        }
+
+        private void ApplyNativeWindowIcons(string icoPath)
+        {
+            try
+            {
+                IntPtr hwnd = new WindowInteropHelper(this).Handle;
+                if (hwnd == IntPtr.Zero) return;
+
+                if (File.Exists(icoPath))
+                {
+                    winBigIcon = new Drawing.Icon(icoPath, 48, 48);
+                    winSmallIcon = new Drawing.Icon(icoPath, 16, 16);
+                }
+                else
+                {
+                    string exePath = Process.GetCurrentProcess().MainModule.FileName;
+                    Drawing.Icon exeIcon = Drawing.Icon.ExtractAssociatedIcon(exePath);
+                    if (exeIcon != null)
+                    {
+                        winBigIcon = exeIcon;
+                        winSmallIcon = exeIcon;
+                    }
+                }
+
+                if (winBigIcon != null)
+                {
+                    SendMessage(hwnd, WM_SETICON, (IntPtr)1, winBigIcon.Handle);
+                    SetClassLongPtrSafe(hwnd, GCLP_HICON, winBigIcon.Handle);
+                }
+                if (winSmallIcon != null)
+                {
+                    SendMessage(hwnd, WM_SETICON, (IntPtr)0, winSmallIcon.Handle);
+                    SendMessage(hwnd, WM_SETICON, (IntPtr)2, winSmallIcon.Handle);
+                    SetClassLongPtrSafe(hwnd, GCLP_HICONSM, winSmallIcon.Handle);
+                }
+            }
+            catch { }
+        }
+
+        private string TryAutoRestoreScenarioOnStartup()
+        {
+            if (!autoRestoreScenarioEnabled) return null;
+
+            byte? saved = EcHardwareController.LoadLastScenario();
+            if (!saved.HasValue) return null;
+
+            byte current = EcHardwareController.ReadShiftByte();
+            if (current == saved.Value) return null;
+
+            bool boost = (saved.Value == 0xC4);
+            string syncState;
+            bool ok = EcHardwareController.WriteShiftMode(saved.Value, boost, out syncState);
+            if (!ok) return null;
+
+            string modeName = EcHardwareController.FormatScenarioLabel(saved.Value, true);
+            return string.Format("✓ 启动已自动恢复上次【{0}】| MSI Center:{1}", modeName, syncState);
+        }
+
+        private void ToggleAutoRestoreScenario()
+        {
+            autoRestoreScenarioEnabled = !autoRestoreScenarioEnabled;
+            EcHardwareController.SaveAutoRestoreScenarioEnabled(autoRestoreScenarioEnabled);
+            if (autoRestoreScenarioEnabled)
+            {
+                EcHardwareController.SaveLastScenario(currentShiftByte);
+                string modeName = EcHardwareController.FormatScenarioLabel(currentShiftByte, false);
+                txtEcStatus.Text = string.Format("✓ 已开启【启动时恢复上次场景】（已记录当前：{0}）", modeName);
+            }
+            else
+            {
+                txtEcStatus.Text = "● 已关闭【启动时恢复上次场景】（重启后硬件默认恢复为均衡模式 0xC1）";
+            }
+            RefreshHardwareState(false);
         }
 
         private void InitSystemTray(string icoPath)
@@ -574,6 +664,9 @@ namespace MsiScenarioLite
             menu.MenuItems.Add(menuBalanced);
             menu.MenuItems.Add(menuSilent);
             menu.MenuItems.Add("-");
+
+            menuAutoRestoreScenario = new WinForms.MenuItem("启动时恢复上次场景 (默认关闭: 重启恢复均衡)", (s, e) => ToggleAutoRestoreScenario());
+            menu.MenuItems.Add(menuAutoRestoreScenario);
 
             menuCoolerBoost = new WinForms.MenuItem("手动开关强冷模式 (Cooler Boost)", (s, e) =>
             {
@@ -630,6 +723,16 @@ namespace MsiScenarioLite
                 trayIcon.Visible = false;
                 trayIcon.Dispose();
                 trayIcon = null;
+            }
+            if (winBigIcon != null)
+            {
+                if (winSmallIcon != null && ! object.ReferenceEquals(winSmallIcon, winBigIcon))
+                {
+                    winSmallIcon.Dispose();
+                }
+                winBigIcon.Dispose();
+                winBigIcon = null;
+                winSmallIcon = null;
             }
             base.OnClosing(e);
         }
@@ -880,9 +983,9 @@ namespace MsiScenarioLite
             };
             TextBlock lblScenarioSub = new TextBlock
             {
-                Text = "EC 直写 + 实时同步 MSI Center · 游戏模式自动开启强冷",
+                Text = "EC 直写 · 重启默认恢复均衡模式 (0xC1)",
                 Foreground = new SolidColorBrush(Color.FromRgb(132, 144, 180)),
-                FontSize = 12,
+                FontSize = 11.5,
                 Margin = new Thickness(10, 3, 0, 0),
                 VerticalAlignment = VerticalAlignment.Center
             };
@@ -890,15 +993,56 @@ namespace MsiScenarioLite
             titleStack.Children.Add(lblScenarioSub);
             scenarioHeader.Children.Add(titleStack);
 
-            btnCoolerBoost = new Border
+            StackPanel headerRightStack = new StackPanel
             {
+                Orientation = Orientation.Horizontal,
                 HorizontalAlignment = HorizontalAlignment.Right,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+
+            btnAutoRestoreScenario = new Border
+            {
                 VerticalAlignment = VerticalAlignment.Center,
                 Background = new SolidColorBrush(Color.FromRgb(25, 31, 56)),
                 BorderBrush = new SolidColorBrush(Color.FromRgb(58, 70, 114)),
                 BorderThickness = new Thickness(1),
                 CornerRadius = new CornerRadius(7),
-                Padding = new Thickness(12, 5, 12, 5),
+                Padding = new Thickness(10, 5, 10, 5),
+                Margin = new Thickness(0, 0, 8, 0),
+                Cursor = Cursors.Hand,
+                ToolTip = "主板 EC 在每次重启后默认重置为均衡模式 (0xC1)。开启此项后，每次启动本软件时将自动重新下发上次保存的场景模式。"
+            };
+            StackPanel arStack = new StackPanel { Orientation = Orientation.Horizontal };
+            dotAutoRestoreScenario = new Ellipse
+            {
+                Width = 8,
+                Height = 8,
+                Fill = new SolidColorBrush(Color.FromRgb(110, 120, 150)),
+                VerticalAlignment = VerticalAlignment.Center,
+                Margin = new Thickness(0, 0, 6, 0)
+            };
+            txtAutoRestoreScenario = new TextBlock
+            {
+                Text = "重启恢复均衡 (默认)",
+                Foreground = new SolidColorBrush(Color.FromRgb(185, 196, 228)),
+                FontSize = 11.5,
+                FontWeight = FontWeights.SemiBold,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            arStack.Children.Add(dotAutoRestoreScenario);
+            arStack.Children.Add(txtAutoRestoreScenario);
+            btnAutoRestoreScenario.Child = arStack;
+            btnAutoRestoreScenario.MouseLeftButtonDown += (s, e) => ToggleAutoRestoreScenario();
+            headerRightStack.Children.Add(btnAutoRestoreScenario);
+
+            btnCoolerBoost = new Border
+            {
+                VerticalAlignment = VerticalAlignment.Center,
+                Background = new SolidColorBrush(Color.FromRgb(25, 31, 56)),
+                BorderBrush = new SolidColorBrush(Color.FromRgb(58, 70, 114)),
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(7),
+                Padding = new Thickness(11, 5, 11, 5),
                 Cursor = Cursors.Hand
             };
             StackPanel cbStack = new StackPanel { Orientation = Orientation.Horizontal };
@@ -914,7 +1058,7 @@ namespace MsiScenarioLite
             {
                 Text = "强冷风扇: 自动",
                 Foreground = new SolidColorBrush(Color.FromRgb(200, 210, 240)),
-                FontSize = 12,
+                FontSize = 11.5,
                 FontWeight = FontWeights.SemiBold,
                 VerticalAlignment = VerticalAlignment.Center
             };
@@ -927,7 +1071,8 @@ namespace MsiScenarioLite
                 EcHardwareController.SetCoolerBoost(next);
                 RefreshHardwareState(true);
             };
-            scenarioHeader.Children.Add(btnCoolerBoost);
+            headerRightStack.Children.Add(btnCoolerBoost);
+            scenarioHeader.Children.Add(headerRightStack);
 
             Grid.SetRow(scenarioHeader, 0);
             contentGrid.Children.Add(scenarioHeader);
@@ -1376,7 +1521,7 @@ namespace MsiScenarioLite
             isBusySwitching = false;
             RefreshHardwareState(true);
 
-            string modeName = shiftCode == 0xC4 ? "游戏模式 + 强冷 (0xC4)" : (shiftCode == 0xC2 ? "节能静音模式 (0xC2)" : "均衡模式 (0xC1)");
+            string modeName = EcHardwareController.FormatScenarioLabel(shiftCode, true);
             if (ok)
             {
                 txtEcStatus.Text = string.Format("✓ 已切换【{0}】| EC 0xD2=0x{1:X2} | MSI Center:{2}",
@@ -1392,35 +1537,38 @@ namespace MsiScenarioLite
         {
             if (isBusySwitching) return;
 
-            // What the firmware will boot into next (authoritative, persisted).
-            bool encoded = stagedIsDiscrete.HasValue ? stagedIsDiscrete.Value : currentIsDiscrete;
+            byte d1Before;
+            bool encoded = EcHardwareController.ReadStagedGpuModeIsDiscrete(currentIsDiscrete, out d1Before);
+            stagedIsDiscrete = encoded;
 
             if (targetDiscrete == encoded)
             {
                 if (encoded != currentIsDiscrete)
                 {
-                    txtEcStatus.Text = string.Format("📌 已标记下次重启切换为【{0}】（点击当前运行的那一侧可取消预约）。", targetDiscrete ? "独显直连" : "混合输出");
+                    txtEcStatus.Text = string.Format("📌 已标记下次重启切换为【{0}】(EC 0xD1=0x{1:X2}，点击当前运行的那一侧可取消预约)。",
+                        targetDiscrete ? "独显直连" : "混合输出", d1Before);
                 }
                 else
                 {
-                    txtEcStatus.Text = string.Format("● 当前硬件正处于【{0}】模式，无需切换。", targetDiscrete ? "独显直连" : "混合输出");
+                    txtEcStatus.Text = string.Format("● 当前硬件正处于【{0}】模式 (EC 0xD1=0x{1:X2})，无需切换。",
+                        targetDiscrete ? "独显直连" : "混合输出", d1Before);
                 }
                 return;
             }
 
-            // Immediate visual feedback, then do the (fast) firmware write off the UI thread.
+            // Immediate visual feedback, then do the EC 0xD1 write off the UI thread.
             SetCenterLoadingState(true);
             stagedIsDiscrete = targetDiscrete;
             UpdateGpuVisuals(currentIsDiscrete, stagedIsDiscrete, true);
-            txtEcStatus.Text = "⏳ 正在写入主板 UEFI 变量 MsiDCVarData 与 EC 0xD1...";
+            txtEcStatus.Text = "⏳ 正在向主板 EC 0xD1 写入 MUX 切换标记并回读校验...";
 
             EcHardwareController.GpuApplyResult result = await Task.Run(() =>
             {
                 Stopwatch sw = Stopwatch.StartNew();
                 EcHardwareController.GpuApplyResult res =
-                    EcHardwareController.ApplyGpuTarget(targetDiscrete, currentIsDiscrete, encoded);
+                    EcHardwareController.ApplyGpuTarget(targetDiscrete, currentIsDiscrete);
 
-                int remain = 260 - (int)sw.ElapsedMilliseconds;
+                int remain = 240 - (int)sw.ElapsedMilliseconds;
                 if (remain > 0) System.Threading.Thread.Sleep(remain);
                 return res;
             });
@@ -1429,7 +1577,7 @@ namespace MsiScenarioLite
 
             if (!result.Ok)
             {
-                // Roll the UI back to the real state instead of leaving a wrong pill.
+                // Roll the UI back to the real hardware state instead of leaving a wrong pill.
                 stagedIsDiscrete = encoded;
                 RefreshHardwareState(false);
                 txtEcStatus.Text = "⚠️ " + result.Error;
@@ -1440,11 +1588,13 @@ namespace MsiScenarioLite
             string targetName = targetDiscrete ? "独显直连 (Discrete)" : "混合输出 (MSHybrid)";
             if (targetDiscrete == currentIsDiscrete)
             {
-                txtEcStatus.Text = string.Format("✓ 已取消切换预约，恢复保持当前【{0}】模式（UEFI 变量已还原）。", targetName);
+                txtEcStatus.Text = string.Format("✓ 已取消切换预约，恢复保持当前【{0}】模式 (EC 0xD1=0x{1:X2})。",
+                    targetName, result.ReadbackD1);
             }
             else
             {
-                txtEcStatus.Text = string.Format("📌 已写入【{0}】标记（UEFI 已校验），下次正常重启后生效。", targetName);
+                txtEcStatus.Text = string.Format("📌 已写入【{0}】预约标记 (EC 0xD1=0x{1:X2} 已校验)，下次正常重启后生效。",
+                    targetName, result.ReadbackD1);
             }
         }
 
@@ -1455,18 +1605,9 @@ namespace MsiScenarioLite
                 currentShiftByte = EcHardwareController.ReadShiftByte();
                 currentCoolerBoost = EcHardwareController.ReadCoolerBoost();
                 currentIsDiscrete = EcHardwareController.ReadIsDiscreteGpuMode();
-                bool? hwStaged = EcHardwareController.ReadStagedGpuModeIsDiscrete();
-                if (hwStaged.HasValue)
-                {
-                    stagedIsDiscrete = hwStaged.Value;
 
-                    // After a reboot the staged target equals the running mode; collapse it
-                    // so the pill never claims a pending switch that already happened.
-                    if (stagedIsDiscrete.Value == currentIsDiscrete)
-                    {
-                        EcHardwareController.SavePersistedGpuTarget(currentIsDiscrete);
-                    }
-                }
+                byte d1;
+                stagedIsDiscrete = EcHardwareController.ReadStagedGpuModeIsDiscrete(currentIsDiscrete, out d1);
 
                 int cpuT, gpuT, cpuRpm, gpuRpm;
                 EcHardwareController.ReadTelemetry(out cpuT, out gpuT, out cpuRpm, out gpuRpm);
@@ -1490,12 +1631,29 @@ namespace MsiScenarioLite
                 ApplyCardStyle(cardBalanced, badgeBalanced, isBalanced, activeBorder, inactiveBorder, activeBg, inactiveBg, animate);
                 ApplyCardStyle(cardSilent, badgeSilent, isSilent, activeBorder, inactiveBorder, activeBg, inactiveBg, animate);
 
+                if (autoRestoreScenarioEnabled)
+                {
+                    btnAutoRestoreScenario.BorderBrush = new SolidColorBrush(Color.FromRgb(64, 148, 255));
+                    btnAutoRestoreScenario.Background = new SolidColorBrush(Color.FromRgb(22, 38, 72));
+                    dotAutoRestoreScenario.Fill = new SolidColorBrush(Color.FromRgb(92, 214, 148));
+                    txtAutoRestoreScenario.Text = "启动恢复上次场景: 开启";
+                    txtAutoRestoreScenario.Foreground = Brushes.White;
+                }
+                else
+                {
+                    btnAutoRestoreScenario.BorderBrush = new SolidColorBrush(Color.FromRgb(58, 70, 114));
+                    btnAutoRestoreScenario.Background = new SolidColorBrush(Color.FromRgb(25, 31, 56));
+                    dotAutoRestoreScenario.Fill = new SolidColorBrush(Color.FromRgb(110, 120, 150));
+                    txtAutoRestoreScenario.Text = "启动恢复上次场景: 关(默认均衡)";
+                    txtAutoRestoreScenario.Foreground = new SolidColorBrush(Color.FromRgb(185, 196, 228));
+                }
+
                 if (currentCoolerBoost)
                 {
                     btnCoolerBoost.BorderBrush = new SolidColorBrush(Color.FromRgb(235, 55, 82));
                     btnCoolerBoost.Background = new SolidColorBrush(Color.FromRgb(48, 24, 42));
                     dotCoolerBoost.Fill = new SolidColorBrush(Color.FromRgb(255, 70, 95));
-                    txtCoolerBoostState.Text = "强冷模式 (Cooler Boost): 开启中";
+                    txtCoolerBoostState.Text = "强冷风扇: 开启中";
                     txtCoolerBoostState.Foreground = Brushes.White;
                 }
                 else
@@ -1503,7 +1661,7 @@ namespace MsiScenarioLite
                     btnCoolerBoost.BorderBrush = new SolidColorBrush(Color.FromRgb(58, 70, 114));
                     btnCoolerBoost.Background = new SolidColorBrush(Color.FromRgb(25, 31, 56));
                     dotCoolerBoost.Fill = new SolidColorBrush(Color.FromRgb(92, 214, 148));
-                    txtCoolerBoostState.Text = "强冷模式 (Cooler Boost): 自动温控";
+                    txtCoolerBoostState.Text = "强冷风扇: 自动温控";
                     txtCoolerBoostState.Foreground = new SolidColorBrush(Color.FromRgb(200, 210, 240));
                 }
 
@@ -1525,6 +1683,7 @@ namespace MsiScenarioLite
                     menuGaming.Checked = isGaming;
                     menuBalanced.Checked = isBalanced;
                     menuSilent.Checked = isSilent;
+                    if (menuAutoRestoreScenario != null) menuAutoRestoreScenario.Checked = autoRestoreScenarioEnabled;
                     menuCoolerBoost.Checked = currentCoolerBoost;
                     bool targetMux = stagedIsDiscrete.HasValue ? stagedIsDiscrete.Value : currentIsDiscrete;
                     menuGpuDiscrete.Checked = targetMux;
@@ -1537,9 +1696,10 @@ namespace MsiScenarioLite
 
                 if (txtEcStatus.Text == "就绪")
                 {
-                    txtEcStatus.Text = string.Format("EC 状态: Shift(0xD2)=0x{0:X2} | Thermal(0x98)=0x{1:X2} | MUX={2}",
+                    txtEcStatus.Text = string.Format("EC 状态: Shift(0xD2)=0x{0:X2} | Thermal(0x98)=0x{1:X2} | MUX(0xD1=0x{2:X2})={3}",
                         currentShiftByte,
                         currentCoolerBoost ? 0x86 : 0x06,
+                        d1,
                         currentIsDiscrete ? "Discrete" : "MSHybrid");
                 }
             }

@@ -1,48 +1,29 @@
 ﻿<#
 .SYNOPSIS
-    Copies the MSI-provided binaries required by MSI Scenario Lite from a local
-    MSI Center installation.
+    Copies the MSI-provided WMI ACPI wrapper required by MSI Scenario Lite from a
+    local MSI Center installation.
 
 .DESCRIPTION
-    This project does not redistribute MSI's proprietary binaries. They are
-    copied from the copy of MSI Center already installed on this machine.
+    This project does not redistribute MSI's proprietary binaries. It copies
+    MSIWMIACPI2.dll from the copy of MSI Center already installed on this machine.
     Nothing is downloaded.
 
-    Source files:
+    Source file:
         <MSI Center>\MSIWMIACPI2.dll
-        <MSI NBFoundation Service>\ResetUEFIVariable.exe
-        <MSI NBFoundation Service>\UEFIVaribleDll.dll
 #>
 [CmdletBinding()]
 param(
-    [string]$MsiCenterDir = 'C:\Program Files (x86)\MSI\MSI Center',
-    [string]$MsiFoundationDir = 'C:\Program Files (x86)\MSI\MSI NBFoundation Service'
+    [string]$MsiCenterDir = 'C:\Program Files (x86)\MSI\MSI Center'
 )
 
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot | Split-Path -Parent
 
-$sources = @(
-    @{ Path = Join-Path $MsiCenterDir 'MSIWMIACPI2.dll'; Name = 'MSIWMIACPI2.dll' }
-    @{ Path = Join-Path $MsiFoundationDir 'ResetUEFIVariable.exe'; Name = 'ResetUEFIVariable.exe' }
-    @{ Path = Join-Path $MsiFoundationDir 'UEFIVaribleDll.dll'; Name = 'UEFIVaribleDll.dll' }
-)
-
-$copied = 0
-foreach ($source in $sources) {
-    if (Test-Path $source.Path) {
-        Copy-Item $source.Path (Join-Path $root $source.Name) -Force
-        Write-Host "Copied $($source.Name)" -ForegroundColor Green
-        $copied++
-    }
-    else {
-        Write-Warning "Not found: $($source.Path)"
-    }
+$sourcePath = Join-Path $MsiCenterDir 'MSIWMIACPI2.dll'
+if (-not (Test-Path $sourcePath)) {
+    throw "Not found: $sourcePath. Install MSI Center, or pass -MsiCenterDir explicitly."
 }
 
-if ($copied -eq 0) {
-    throw 'No dependencies were copied. Install MSI Center, or pass -MsiCenterDir / -MsiFoundationDir explicitly.'
-}
-
-Write-Host ''
-Write-Host "Done ($copied/3). These files are git-ignored and must not be redistributed."
+Copy-Item $sourcePath (Join-Path $root 'MSIWMIACPI2.dll') -Force
+Write-Host 'Copied MSIWMIACPI2.dll' -ForegroundColor Green
+Write-Host 'Done (1/1). This file is git-ignored and must not be redistributed.'

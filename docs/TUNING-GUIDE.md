@@ -169,6 +169,20 @@ bcdedit /set hypervisorlaunchtype off      # 需要时用 auto 恢复
 
 **验证**：`HWiNFO64` 里看 `PL1 / PL2`，满载时 `Package Power` 应能逼近设定值；重启后数值不该被改小。
 
+### 4.4 解锁 PPT 后的关键坑位：务必配合「独显直连」使用
+
+> ⚠️ **实测结论**：在解锁 `PPT`（如设为 `110000` mW）后，**日常插电使用务必切到「独显直连（Discrete）」模式**；若停留在「混合输出（MSHybrid）」模式，会出现**即使 CPU 核心占用只有 10%~15%，封装总功耗仍飙到 `75 W+`、温度直冲 `95~98°C`** 的异常高温现象。
+
+原因来自两个硬件机制的叠加：
+
+1. **主板 EC 的整机交叉负载分流（Crossload Limit）**：
+   - 在**独显直连**模式下，RTX 4060 全程接管桌面合成、浏览器硬件加速与远程串流/抓屏编码（如 UU 远程、Parsec、OBS 等）。主板 EC 检测到独显处于活跃供电状态，会自动触发交叉负载保护，把 CPU 的日常实际持续功耗合理约束在 `50~65 W` 区间（✅ 实测即使 `CCD0 = 0`、`CCD1 = -15`，温度也稳定在 `80°C` 出头）。
+   - 在**混合输出**模式下，若未触发独显高负载，整机功耗预算无人分流，解锁后的 `110 W` PPT 上限会让 CPU 在轻中度混合负载下毫无节制地拉高平均功耗。
+2. **CPU 内部 IOD 核显（Radeon 610M）的发热叠加**：
+   - 混合模式下，内屏桌面合成与远程桌面的高频抓屏渲染默认压在 CPU 基板内部的 **IOD 核显模块（Radeon 610M）** 上（实测远程桌面下核显 3D 占用可达 `98%+`），甚至还会触发核显与独显之间的跨 PCIe 显存拷贝，导致 IOD 控制器、PCIe 总线与核显同时锁死在最高电压与满负荷状态。
+   - 核显与 IOD 产生的废热和功耗**全部计入 CPU 封装功率（Package Power）**，并与小面积 CCD 争抢同一套热管。
+   - 切回**独显直连**后，CPU 内部的 610M 核显直接**物理断电（0 W）**，图形与编码负载全部转移给散热模组大得多的独立显卡。
+
 ---
 
 ## 5. Curve Optimizer：数值参考（本文最重要的一节）
@@ -341,15 +355,18 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\WHEA-Alert.ps1 -Unin
 
 ## 7. 显卡侧：两件低风险高收益的事
 
-### 7.1 独显直连（MUX）
+### 7.1 独显直连（MUX）—— 解锁 PPT 后的必选项
 
-混合输出模式下，独显渲染的画面要经核显转发，同时占用一部分内存带宽。切到独显直连后：
+混合输出模式下，独显渲染的画面要经核显转发，同时占用一部分内存带宽；更致命的是，解锁 `PPT` 后若留在混合输出，CPU 内部的 610M 核显与 IOD 会独自扛下桌面合成/远程抓屏负载，且缺少主板 EC 的独显交叉负载分流（Crossload Limit），极易出现「CPU 占用仅十几个百分点，功耗却飙到 75 W+、温度逼近 98°C」（详见 §4.4）。
 
-- 游戏帧率通常 `+5%~15%`
-- 释放核显占用的内存与带宽
-- 代价：续航变差，且**必须重启才生效**
+切到独显直连后：
 
-可以用本仓库的 [`MSI Scenario Lite`](../README.md) 切换，它只写标记、不强制重启，随时可取消。
+- **CPU 内部 610M 核显物理断电（0 W）**，远程编码与桌面合成全部交由散热模组更大的独显处理
+- **触发主板 EC 动态功耗分流**，日常使用 CPU 功耗自然稳定在 `50~65 W`、温度回落至 `80°C` 左右
+- 游戏帧率通常 `+5%~15%`，并释放核显占用的内存与带宽
+- 代价：离电续航变差，且**必须重启才生效**
+
+可以用本仓库的 [`MSI Scenario Lite`](../README.md) 切换，它只写 `EC 0xD1` 预约标记并回读校验、不强制重启，随时可再次点击取消。
 
 ### 7.2 解除 CUDA 的 P2 显存降频
 
@@ -380,7 +397,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\WHEA-Alert.ps1 -Unin
 | 场景 | `EC 0xD2 = 0xC4 / 0xC1 / 0xC2` | 游戏 / 均衡 / 节能静音 |
 | 强冷 | `EC 0x98` bit 7 | 切游戏模式自动开启 |
 | 自动风扇恢复 | `EC 0xD4` bit 7 清零 | 交还 EC 温度曲线 |
-| 显卡模式 | `EC 0xD1` + UEFI `MsiDCVarData` | 只写标记，下次重启生效 |
+| 显卡模式 | `EC 0xD1`（`0x06` 独显 / `0x02` 混合） | 只写标记并回读校验，下次重启生效 |
 
 不碰 `0x50 / 0x51`，所以 BIOS 里的功耗墙不会被吃掉。寄存器细节见 [`EC-REGISTER-REFERENCE.md`](EC-REGISTER-REFERENCE.md)。
 
@@ -407,6 +424,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\WHEA-Alert.ps1 -Unin
 | 反复 `WHEA-Logger Event 19` + `Cache Hierarchy Error`，`APIC ID` 固定 | CCD 共享 L3 被低载低电压拖垮 | 该 CCD 全部负压归零 |
 | 蓝屏代码多变（`MEMORY_MANAGEMENT` 等） | 内存频率/时序不稳 | 内存回 `Auto` |
 | 温度冲到 `100°C` 后锁 `0.5 GHz`，重启才恢复 | 触发 `BD PROCHOT` 硬件闩锁 | 设 `Platform Thermal Throttle Limit = 85`，检查散热与 VRM |
+| 解锁 PPT 后 CPU 核心占用很低（10%~15%），但总功耗 75 W+、温度飙到 95~98°C | 处于混合输出（MSHybrid）模式，CPU 内部 610M 核显/IOD 满载发热且无独显交叉负载分流 | 切回 **独显直连（Discrete）** 并重启（核显物理断电 + 触发 EC 功耗分流） |
 | BIOS 改完功耗墙，重启又变回低值 | 原版 MSI Center 后台服务覆盖 EC | 禁用其服务 / UWP 启动项 |
 | 显卡切换点了没反应 | 写入被拒（权限）或标记已处于目标态 | 以管理员运行；再点一次原模式取消预约 |
 | 进 BIOS 看不到 `AMD Overclocking` | 隐藏菜单未解锁 | `右 Ctrl + 右 Shift + 左 Alt + F2`（每次进 BIOS 都要按） |
@@ -422,6 +440,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\WHEA-Alert.ps1 -Unin
 | 温度墙 `Thermal Limit` | `85` | **`85`** | `90`（只求不撞 100°C） |
 | 频率上限 `Boost Override (-)` | 不设 | **`300`** | `400` |
 | 内存 | `Auto` | **`5200`，时序 Auto** | `5600`（仅单面对称组合） |
+| 显卡模式（MUX） | 独显直连 | **独显直连（Discrete，解锁 PPT 必选）** | 独显直连（Discrete） |
 | HVCI | 关闭 | **关闭** | 关闭 |
 
 ---
