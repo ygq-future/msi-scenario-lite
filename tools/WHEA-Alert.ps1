@@ -182,7 +182,7 @@ function Test-AlertPopup {
 如果你看到这个窗口，说明弹窗链路正常。
 真实触发时，这里会显示 WHEA 事件 ID、发生时间与完整错误描述。
 
-建议立即保存当前工作，并检查 BIOS 中的 Curve Optimizer 负压设置。
+建议立即保存当前工作，并将 BIOS 中的 Curve Optimizer 负压改为 Disabled（全 0），改用 CBCO 负向频率上限与 PTTL 温度墙降温。
 "@
 }
 
@@ -220,8 +220,8 @@ function Show-EventAlert {
 
 $($event.Message)
 
-建议立即保存当前工作，并检查 BIOS 中的 Curve Optimizer 负压设置。
-（CCD 共享 L3 缓存被低载低电压拖垮时，通常会先连续出现本警告，最后才硬重启。）
+建议立即保存当前工作，并将 BIOS 中的 Curve Optimizer 负压改为 Disabled（全 0），改用 CBCO 负向频率上限与 PTTL 温度墙降温。
+（同一 CCD 共享 32 MB L3 缓存在单核轻载唤醒时被 CO 负压拖垮，通常会先出现本警告，累积后直接触发硬件复位重启。）
 "@
     Show-Alert -Title 'WHEA 硬件错误实时告警' -Body $body
 }

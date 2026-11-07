@@ -151,7 +151,7 @@ MsiScenarioLite.exe
 
 | 文档 | 内容 |
 | :--- | :--- |
-| [`docs/TUNING-GUIDE.md`](docs/TUNING-GUIDE.md) | 双 CCD Ryzen 9 笔记本的调优与稳定性指南：**BIOS 隐藏菜单进入方法**、**PPT/TDC/EDC 与 Curve Optimizer 的具体参考数值**（含最保守档）、HVCI、内存频率上限、共享 L3 电压陷阱、温度墙与频率上限、MUX、CUDA P2、CCD 亲和性、验证流程 |
+| [`docs/TUNING-GUIDE.md`](docs/TUNING-GUIDE.md) | 双 CCD Ryzen 9 笔记本的调优与稳定性指南：**BIOS 隐藏菜单进入方法**、**PPT 甜点功耗（75~85 W）与温度墙/频率上限（PTTL + CBCO）实测数值**、**为什么 Curve Optimizer 负压会拖垮共享 L3 缓存（`0x20350000`）**、HVCI、内存频率上限、MUX 独显直连、CUDA P2、CCD 亲和性、验证流程 |
 | [`docs/EC-REGISTER-REFERENCE.md`](docs/EC-REGISTER-REFERENCE.md) | EC 寄存器与 WMI 方法对照表、MSI Center 内部场景索引、已知坑位 |
 
 ---
